@@ -20,12 +20,15 @@ export interface NetworkErrorClassification {
   recommendedNextAction: string;
 }
 
-/** Walks `error.cause` chains (undici wraps the real errno/TLS error a level or two down). */
+/** Walks `error.cause` chains for matching TLS/network error codes. */
 function findCauseCode(error: unknown, depth = 5): string | undefined {
   let current: unknown = error;
   for (let i = 0; i < depth && current; i++) {
     if (typeof current === "object" && "code" in current && typeof (current as { code: unknown }).code === "string") {
-      return (current as { code: string }).code;
+      const code = (current as { code: string }).code;
+      if (TLS_CAUSE_CODES.has(code) || code === "ENOTFOUND" || code === "ECONNREFUSED") {
+        return code;
+      }
     }
     current = current instanceof Error ? current.cause : undefined;
   }

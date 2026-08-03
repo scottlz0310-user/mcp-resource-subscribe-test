@@ -48,6 +48,14 @@ describe("classifyNetworkError", () => {
     expect(result?.errorCode).toBe("CONNECTION_REFUSED");
   });
 
+  it("walks cause chain even if outer error has an unrelated code like ERR_FETCH_FAILED", () => {
+    const root = Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" });
+    const fetchErr = Object.assign(new TypeError("fetch failed", { cause: root }), { code: "ERR_FETCH_FAILED" });
+    const result = classifyNetworkError(fetchErr);
+
+    expect(result?.errorCode).toBe("CONNECTION_REFUSED");
+  });
+
   it("returns null for an unrelated error code", () => {
     const cause = Object.assign(new Error("something else"), { code: "EPIPE" });
     expect(classifyNetworkError(fetchFailed(cause))).toBeNull();
