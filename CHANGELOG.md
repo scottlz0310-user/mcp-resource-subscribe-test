@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- 依存パッケージの脆弱性勧告に対応（`@modelcontextprotocol/sdk` の更新およびそれに伴う間接依存の修正）
+
 ### Fixed
 
 - `classifyNetworkError` で最外周の Error オブジェクト自体に `code` プロパティ（`ERR_FETCH_FAILED` 等）が存在する場合に `cause` チェーンの探索が中断され、ネストされた `ECONNREFUSED` や `ENOTFOUND` などのエラーコードが分類できず `CALL_FAILED` に倒れる問題を修正
