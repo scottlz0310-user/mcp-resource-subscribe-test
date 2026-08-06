@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- 依存パッケージの脆弱性勧告に対応（`fast-uri` 3.1.5, `@hono/node-server` 2.1.0, `hono` 4.13.0）
+- 依存パッケージの脆弱性勧告に対応（`@modelcontextprotocol/sdk` の更新およびそれに伴う間接依存の修正）
 
 ### Fixed
 
