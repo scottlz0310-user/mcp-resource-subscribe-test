@@ -51,12 +51,12 @@
     "@biomejs/biome": "^2.5.9",
     "@types/express": "^5.0.6",
     "@types/node": "^26.1.2",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^4.1.11",
     "express": "^5.2.1",
     "lefthook": "^2.1.10",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "engines": {
     "node": ">=26.5.1"
