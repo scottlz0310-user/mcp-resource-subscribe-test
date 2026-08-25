@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `vitest` が `dist/test/*.test.js` も収集し、`pnpm run build` 後に `pnpm test` を実行するとコンパイル済みの古いテストが二重実行されていたのを修正。vitest 4 の `defaultExclude` から `dist` が外れたのが原因で、`vitest.config.ts` の `test.exclude` に `dist/**` を明示した（CI は build 前に test するため公開物への影響はなし）
+- `vitest` が `dist/test/*.test.js` も収集し、`pnpm run build` 後の test 実行でコンパイル済みのテストが二重実行されていたのを修正。vitest 4 の `defaultExclude` から `dist` が外れたのが原因で、`vitest.config.ts` の `test.exclude` に `dist/**` を明示した。`ci.yml`（`build` → `test:coverage`）と `publish.yml`（`build` → `typecheck` → `test`）も build 後に test を実行するため CI でも二重実行が起きていたが、clean checkout では `dist/` が常に同一コミットの build 成果物であり検証結果自体は正しかったため、公開物への影響はない。ローカルでは古い `dist/` が残っていると、ソースを直した後もコンパイル前のテストが緑で通り得た
 
 ## [0.6.0] - 2026-08-25
 
