@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-25
+
+### Added
+
+- `PROTOCOL_UNSUPPORTED` errorCode: 接続先が `2026-07-28` を提供できない場合に、subscribe / call 両モードで明示的に失敗する（`recommendedNextAction` にサーバー側の更新を促すヒントを含む）
+- `SUBSCRIPTION_NOT_HONORED` / `SUBSCRIPTION_DISCONNECTED` / `SUBSCRIPTION_CLOSED` errorCode
+- `2026-07-28` の contract test: listen → ack → `notifications/resources/updated` → `resources/read`、ack での URI 欠落、listen 拒否、stream 異常切断、legacy `initialize` の拒否（`-32022`）と GET `405`、未移行サーバーに対する negotiation 失敗
+
 ### Changed
 
 - **BREAKING**: MCP protocol revision `2026-07-28` へ移行し、TypeScript SDK を `@modelcontextprotocol/sdk` 1.30.0（v1 系終端）から `@modelcontextprotocol/{client,core,server,node}` 2.0.0 へ手動移行（#162、横断 tracker: scottlz0310/thread-owl#165）
@@ -24,27 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - リファレンスサーバーが購読サイクルごとに resource の状態を version 1 へ戻すようになった（listen stream が 1 本も無い状態での `resources/read` をサイクル境界とする）。stateless 化で `store` がアプリスコープになったため、同じサーバープロセスに対する 2 回目以降の probe が更新を観測できなくなっていた
 - probe クライアントの `resources/read` / `resources/list` を `cacheMode: "bypass"` に固定（SDK v2 は SEP-2549 の cache hint を尊重するため、`ttlMs > 0` を返すサーバーに対して古い内容を現在値として報告しうる）
 
-### Added
-
-- `PROTOCOL_UNSUPPORTED` errorCode: 接続先が `2026-07-28` を提供できない場合に、subscribe / call 両モードで明示的に失敗する（`recommendedNextAction` にサーバー側の更新を促すヒントを含む）
-- `SUBSCRIPTION_NOT_HONORED` / `SUBSCRIPTION_DISCONNECTED` / `SUBSCRIPTION_CLOSED` errorCode
-- `2026-07-28` の contract test: listen → ack → `notifications/resources/updated` → `resources/read`、ack での URI 欠落、listen 拒否、stream 異常切断、legacy `initialize` の拒否（`-32022`）と GET `405`、未移行サーバーに対する negotiation 失敗
-
 ### Fixed
 
 - listen stream が「通知待機の合間」に切断された場合、待機側に waiter が居らず切断を取りこぼし、次の待機が `SUBSCRIPTION_DISCONNECTED` ではなく `NOTIFICATION_TIMEOUT` を返していたのを修正（切断状態を保持し、以降の待機を即座に落とす）
 - SIGTERM / SIGINT 受信時、`closeAllConnections()` が MCP handler の `close()` 完了後にしか実行されず、開いている `subscriptions/listen` stream があるとサーバーが終了できなかったのを修正
 - `classifyNetworkError` が `SdkError` の `data.cause` を辿らず、version negotiation 中に発生した DNS 解決失敗・接続拒否・TLS 不信頼を分類できなかったのを修正
+- `classifyNetworkError` で最外周の Error オブジェクト自体に `code` プロパティ（`ERR_FETCH_FAILED` 等）が存在する場合に `cause` チェーンの探索が中断され、ネストされた `ECONNREFUSED` や `ENOTFOUND` などのエラーコードが分類できず `CALL_FAILED` に倒れる問題を修正
 - リファレンスサーバーの Docker runtime stage が `pnpm install --prod` で devDependencies を除外していたため、devDependencies にしか存在しない依存（`express` ほか）を読み込めず起動できなかったのを修正
 
 ### Security
 
 - 依存パッケージの脆弱性勧告に対応（`@modelcontextprotocol/sdk` の更新およびそれに伴う間接依存の修正）
 
-### Fixed
-
-- `classifyNetworkError` で最外周の Error オブジェクト自体に `code` プロパティ（`ERR_FETCH_FAILED` 等）が存在する場合に `cause` チェーンの探索が中断され、ネストされた `ECONNREFUSED` や `ENOTFOUND` などのエラーコードが分類できず `CALL_FAILED` に倒れる問題を修正
-
+## [0.5.0] - 2026-07-13
 
 ### Added
 
@@ -222,7 +222,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `src/server/mcpServer.ts` contains a hardcoded version string (bundled test server, not part of the published npm package). This must be updated manually on each version bump. `src/client/probeClient.ts` / `src/client/callClient.ts` resolve their version dynamically from `package.json` as of v0.5.0 and no longer need manual updates.
 
-[Unreleased]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.2.0...v0.3.0
