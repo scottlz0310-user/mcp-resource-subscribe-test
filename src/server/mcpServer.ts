@@ -1,12 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  ErrorCode,
-  ListResourcesRequestSchema,
-  McpError,
-  ReadResourceRequestSchema,
-  SubscribeRequestSchema,
-  UnsubscribeRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
+import { McpServer, ProtocolError, ProtocolErrorCode } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { TestConfig } from "./config.js";
 import type { LogSink } from "./logger.js";
@@ -14,22 +6,29 @@ import {
   REVIEW_STATUS_MIME_TYPE,
   REVIEW_STATUS_RESOURCE,
   REVIEW_STATUS_URI,
-  ReviewStatusStore,
+  type ReviewStatusStore,
   renderReviewStatus,
 } from "./resourceState.js";
 
-export interface ProbeServer {
-  server: McpServer;
+export interface ProbeServerDeps {
+  config: TestConfig;
+  /** リクエスト間で共有される状態。McpServer は 2026-07-28 ではリクエストごとに作り直されるため、ここに置けない。 */
   store: ReviewStatusStore;
+  log?: LogSink;
+  /** resources/read を受けたときに呼ばれる。購読サイクル境界の判定に使う。 */
+  onResourceRead?: (uri: string) => void;
 }
 
 function assertReviewStatusUri(uri: string): void {
   if (uri !== REVIEW_STATUS_URI) {
-    throw new McpError(ErrorCode.InvalidParams, `Unknown resource URI: ${uri}`);
+    throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Unknown resource URI: ${uri}`);
   }
 }
 
-export function createProbeServer(config: TestConfig, log: LogSink = () => undefined): ProbeServer {
+export function createProbeServer(deps: ProbeServerDeps): McpServer {
+  const { config, store } = deps;
+  const log: LogSink = deps.log ?? (() => undefined);
+
   const server = new McpServer(
     {
       name: "mcp-resource-subscribe-test",
@@ -39,15 +38,11 @@ export function createProbeServer(config: TestConfig, log: LogSink = () => undef
       capabilities: {
         resources: {
           subscribe: true,
-          listChanged: true,
+          listChanged: config.sendListChanged,
         },
       },
     },
   );
-
-  const store = new ReviewStatusStore(config);
-  const subscriptions = new Set<string>();
-  let updateTimer: NodeJS.Timeout | undefined;
 
   server.registerTool(
     "get_review_status",
@@ -83,44 +78,19 @@ export function createProbeServer(config: TestConfig, log: LogSink = () => undef
     },
   );
 
-  const scheduleUpdate = () => {
-    if (updateTimer || store.get().version >= 2) {
-      return;
-    }
-
-    updateTimer = setTimeout(() => {
-      void (async () => {
-        updateTimer = undefined;
-        const state = store.markUpdated();
-        log(`[resource/update] uri=${REVIEW_STATUS_URI} version=${state.version}`);
-
-        if (subscriptions.has(REVIEW_STATUS_URI)) {
-          log(`[notification/send] notifications/resources/updated uri=${REVIEW_STATUS_URI}`);
-          await server.server.sendResourceUpdated({ uri: REVIEW_STATUS_URI });
-        }
-
-        if (config.sendListChanged) {
-          log("[notification/send] notifications/resources/list_changed");
-          await server.server.sendResourceListChanged();
-        }
-      })().catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        log(`[notification/error] ${message}`);
-      });
-    }, config.updateDelaySeconds * 1000);
-  };
-
-  server.server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  server.server.setRequestHandler("resources/list", async () => {
     log("[resources/list] requested");
     return {
       resources: [REVIEW_STATUS_RESOURCE],
     };
   });
 
-  server.server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  server.server.setRequestHandler("resources/read", async (request) => {
     const uri = request.params.uri;
     assertReviewStatusUri(uri);
 
+    // 状態を読む前に通知する。購読サイクル先頭での初期状態リセットをこの応答へ反映させるため。
+    deps.onResourceRead?.(uri);
     const state = store.get();
     log(`[resources/read] uri=${uri} version=${state.version}`);
 
@@ -135,25 +105,5 @@ export function createProbeServer(config: TestConfig, log: LogSink = () => undef
     };
   });
 
-  server.server.setRequestHandler(SubscribeRequestSchema, async (request) => {
-    const uri = request.params.uri;
-    log(`[resources/subscribe] uri=${uri}`);
-    assertReviewStatusUri(uri);
-
-    subscriptions.add(uri);
-    scheduleUpdate();
-
-    return {};
-  });
-
-  server.server.setRequestHandler(UnsubscribeRequestSchema, async (request) => {
-    const uri = request.params.uri;
-    log(`[resources/unsubscribe] uri=${uri}`);
-    assertReviewStatusUri(uri);
-
-    subscriptions.delete(uri);
-    return {};
-  });
-
-  return { server, store };
+  return server;
 }

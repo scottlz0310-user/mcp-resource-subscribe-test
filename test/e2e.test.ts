@@ -51,7 +51,7 @@ describe.skipIf(!E2E_URL)("E2E: external MCP server (copilot-review-mcp)", () =>
 
     expect(result.resourceFound).toBe(false);
     expect(result.errorCode).toBe("RESOURCE_NOT_FOUND");
-    expect(result.subscribed).toBe(false);
+    expect(result.listenAcknowledged).toBe(false);
   }, 15_000);
 
   it.skipIf(!E2E_WATCH_ID)(
@@ -70,11 +70,12 @@ describe.skipIf(!E2E_URL)("E2E: external MCP server (copilot-review-mcp)", () =>
       });
 
       expect(result.resourceFound).toBe(true);
-      expect(result.subscribed).toBe(true);
+      expect(result.listenAcknowledged).toBe(true);
+      expect(result.honoredUris).toContain(uri);
       expect(result.route).toBe("subscription");
       expect(result.notificationUri).toBe(uri);
       expect(result.finalText).toBeTruthy();
-      expect(result.unsubscribed).toBe(true);
+      expect(result.closeReason).toBe("local");
       expect(result.errorCode).toBeNull();
     },
     910_000,

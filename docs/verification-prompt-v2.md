@@ -1,5 +1,11 @@
 # Verification Prompt — Round 2 (with tools)
 
+> **Historical (pre-`2026-07-28`)**: this document records the 2025-era compatibility spike.
+> The reference server no longer implements `resources/subscribe` / `resources/unsubscribe` —
+> it speaks MCP `2026-07-28` and answers a 2025-era `initialize` with `-32022`. Following the
+> steps below against the current server will fail. See the README's
+> [Expected Client Behavior](../README.md#expected-client-behavior) for the flow in use today.
+
 This prompt template is designed to be passed to another MCP client agent for Round 2 verification.  
 Replace `<CLIENT_NAME>` with the target client name before use.
 

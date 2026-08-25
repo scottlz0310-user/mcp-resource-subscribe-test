@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: MCP protocol revision `2026-07-28` へ移行し、TypeScript SDK を `@modelcontextprotocol/sdk` 1.30.0（v1 系終端）から `@modelcontextprotocol/{client,core,server,node}` 2.0.0 へ手動移行（#162、横断 tracker: scottlz0310/thread-owl#165）
+  - `resources/subscribe` / `resources/unsubscribe` RPC は `2026-07-28` で廃止された。購読は `subscriptions/listen` を POST し、`params.notifications.resourceSubscriptions` で URI を指定する方式に全面置換。解除は stream を閉じることで行う
+  - `notifications/subscriptions/acknowledged`（ack）を待ってから通知待機に入る。ack に含まれる honored filter と要求 URI を突き合わせ、要求した URI が honor されていなければ待ち続けずに `SUBSCRIPTION_NOT_HONORED` を返す
+  - listen stream が応答なしに切断された場合を異常切断として検知し、`--timeout-ms` を待たずに `SUBSCRIPTION_DISCONNECTED` を返す
+  - protocol revision は `2026-07-28` に **pin** する。legacy protocol への暗黙のフォールバックは行わず、`2026-07-28` を提供できないサーバーへの接続は `PROTOCOL_UNSUPPORTED` として明示的に失敗する
+  - リファレンスサーバー（`src/server/`）を stateless 化。`Mcp-Session-Id` ベースの session map を撤去し、`createMcpHandler(factory, { legacy: "reject" })` + `toNodeHandler` へ置き換え。standalone GET SSE endpoint は廃止され GET / DELETE は `405` を返す。long-lived stream 向けに `X-Accel-Buffering: no` を付与する
+- **BREAKING**: subscribe モードの出力スキーマを新 protocol に合わせて変更
+  - `--json`: `subscribed` / `unsubscribed` を削除し、`listenAcknowledged` / `honoredUris` / `closeReason`（`"local"` | `"graceful"` | `"remote"` | `null`）を追加
+  - line-based: `subscribed` / `unsubscribed` 行を削除し、`listen-acknowledged` / `honored-uris` / `close-reason` 行を追加
+  - `route` / `errorCode` / `notificationReceived` / `finalText` は互換のまま（`squirrel-notifier` はこの 4 つのみを解釈する）
+- **BREAKING**: `call` モードで不明な tool 名・不正な引数は、tool 実行失敗（exit code `1` / `TOOL_ERROR`）ではなく tools/call 自体の拒否として扱い、exit code `3` / `TOOL_REQUEST_REJECTED` を返すようになった。`2026-07-28` では server が tool 実行前に `-32602` で拒否するため
+- リファレンスサーバーの更新シミュレーションの起点を `resources/subscribe` の受信から `subscriptions/listen` の stream 開通に変更（新 protocol には subscribe RPC が無いため、`createMcpHandler` へ渡す `ServerEventBus` の listener 登録を購読開始のシグナルとして使う）。read を起点にすると通知の発行時点で stream が開いておらず通知が失われうる
+- リファレンスサーバーが購読サイクルごとに resource の状態を version 1 へ戻すようになった（listen stream が 1 本も無い状態での `resources/read` をサイクル境界とする）。stateless 化で `store` がアプリスコープになったため、同じサーバープロセスに対する 2 回目以降の probe が更新を観測できなくなっていた
+- probe クライアントの `resources/read` / `resources/list` を `cacheMode: "bypass"` に固定（SDK v2 は SEP-2549 の cache hint を尊重するため、`ttlMs > 0` を返すサーバーに対して古い内容を現在値として報告しうる）
+
+### Added
+
+- `PROTOCOL_UNSUPPORTED` errorCode: 接続先が `2026-07-28` を提供できない場合に、subscribe / call 両モードで明示的に失敗する（`recommendedNextAction` にサーバー側の更新を促すヒントを含む）
+- `SUBSCRIPTION_NOT_HONORED` / `SUBSCRIPTION_DISCONNECTED` / `SUBSCRIPTION_CLOSED` errorCode
+- `2026-07-28` の contract test: listen → ack → `notifications/resources/updated` → `resources/read`、ack での URI 欠落、listen 拒否、stream 異常切断、legacy `initialize` の拒否（`-32022`）と GET `405`、未移行サーバーに対する negotiation 失敗
+
+### Fixed
+
+- listen stream が「通知待機の合間」に切断された場合、待機側に waiter が居らず切断を取りこぼし、次の待機が `SUBSCRIPTION_DISCONNECTED` ではなく `NOTIFICATION_TIMEOUT` を返していたのを修正（切断状態を保持し、以降の待機を即座に落とす）
+- SIGTERM / SIGINT 受信時、`closeAllConnections()` が MCP handler の `close()` 完了後にしか実行されず、開いている `subscriptions/listen` stream があるとサーバーが終了できなかったのを修正
+- `classifyNetworkError` が `SdkError` の `data.cause` を辿らず、version negotiation 中に発生した DNS 解決失敗・接続拒否・TLS 不信頼を分類できなかったのを修正
+- リファレンスサーバーの Docker runtime stage が `pnpm install --prod` で devDependencies を除外していたため、devDependencies にしか存在しない依存（`express` ほか）を読み込めず起動できなかったのを修正
+
 ### Security
 
 - 依存パッケージの脆弱性勧告に対応（`@modelcontextprotocol/sdk` の更新およびそれに伴う間接依存の修正）

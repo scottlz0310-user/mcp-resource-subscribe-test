@@ -50,10 +50,11 @@ function printResult(result: Awaited<ReturnType<typeof runSubscribeProbe>>, url:
     console.log(result.initialText);
   }
   console.log(`route ${result.route}`);
-  console.log(`subscribed ${result.subscribed}`);
+  console.log(`listen-acknowledged ${result.listenAcknowledged}`);
+  console.log(`honored-uris ${JSON.stringify(result.honoredUris)}`);
   console.log(`notification-received ${result.route === "subscription"}`);
   console.log(`notification-count ${result.notificationCount}`);
-  console.log(`unsubscribed ${result.unsubscribed}`);
+  console.log(`close-reason ${result.closeReason ?? "null"}`);
   const recommendedAction = extractRecommendedAction(result.finalText);
   if (recommendedAction) {
     console.log(`recommended_next_action ${recommendedAction}`);

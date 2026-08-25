@@ -20,7 +20,8 @@ FROM base AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --prod --frozen-lockfile
+# リファレンスサーバーは devDependencies（express / @modelcontextprotocol/{server,node}）で動くため --prod では起動できない。
+RUN pnpm install --frozen-lockfile
 COPY --from=build /app/dist ./dist
 EXPOSE 8089
 CMD ["node", "dist/src/server/index.js"]

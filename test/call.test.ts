@@ -45,7 +45,7 @@ async function runCli(args: string[], env: Record<string, string | undefined> = 
 }
 
 async function startTestServer(): Promise<{ url: string; close: () => Promise<void> }> {
-  const app = createMcpHttpApp(
+  const { app, close: closeHandler } = createMcpHttpApp(
     {
       port: 0,
       mcpPath: "/mcp",
@@ -61,8 +61,10 @@ async function startTestServer(): Promise<{ url: string; close: () => Promise<vo
   await once(server, "listening");
   const { port } = server.address() as AddressInfo;
   const url = `http://127.0.0.1:${port}/mcp`;
-  const close = (): Promise<void> =>
-    new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  const close = async (): Promise<void> => {
+    await closeHandler();
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  };
   return { url, close };
 }
 
@@ -322,15 +324,18 @@ describe("call subcommand: communication error", () => {
   // internally and reports it as a normal CallToolResult with isError: true
   // (not a JSON-RPC protocol error), so this surfaces as TOOL_ERROR/exit 1
   // rather than a communication failure.
-  it("unknown tool name surfaces as a tool-level error (TOOL_ERROR), exit code 1", async () => {
+  // 2026-07-28 の SDK では不明な tool 名は tools/call の拒否（-32602）として返る。
+  // tool 実行そのものの失敗（isError / TOOL_ERROR / exit 1）とは別物として扱う。
+  it("unknown tool name surfaces as a rejected request (TOOL_REQUEST_REJECTED), exit code 3", async () => {
     const { url, close } = await startTestServer();
     try {
       const result = await runCli(["--url", url, "--tool", "does_not_exist", "--json", "--timeout-ms", "3000"]);
 
-      expect(result.exitCode).toBe(1);
+      expect(result.exitCode).toBe(3);
       const json = JSON.parse(result.stdout) as CallJsonOutput;
-      expect(json.errorCode).toBe("TOOL_ERROR");
+      expect(json.errorCode).toBe("TOOL_REQUEST_REJECTED");
       expect(json.isError).toBe(true);
+      expect(json.recommendedNextAction).toContain("--tool");
     } finally {
       await close();
     }

@@ -1,4 +1,4 @@
-import type { Resource } from "@modelcontextprotocol/sdk/types.js";
+import type { Resource } from "@modelcontextprotocol/server";
 import type { TestConfig } from "./config.js";
 
 export const REVIEW_STATUS_URI = "test://review/status";
@@ -45,6 +45,12 @@ export class ReviewStatusStore {
   }
 
   get(): ReviewStatusState {
+    return this.state;
+  }
+
+  /** 次の購読サイクルのために初期状態へ戻す。同一プロセスへ何度でも probe を当てられるようにする。 */
+  reset(): ReviewStatusState {
+    this.state = createInitialReviewStatus(this.config);
     return this.state;
   }
 

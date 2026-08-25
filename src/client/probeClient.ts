@@ -1,6 +1,5 @@
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { ResourceUpdatedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { Client, type McpSubscription, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { connectPinned, PINNED_CLIENT_OPTIONS } from "./protocolNegotiation.js";
 
 // Default URI for the bundled reference server (test://review/status)
 const REVIEW_STATUS_URI = "test://review/status";
@@ -34,19 +33,46 @@ export interface SubscribeProbeResult {
   /**
    * How the probe completed:
    * - "subscription"     — received notifications/resources/updated, then re-read
-   * - "pre-completion"   — post-subscribe read detected the resource was already
-   *                        updated (race: notification fired before subscribe)
+   * - "pre-completion"   — post-listen read detected the resource was already
+   *                        updated (race: the notification fired before the
+   *                        subscription was acknowledged)
    * - "timeout"          — notification never arrived within timeoutMs
    */
   route: "subscription" | "pre-completion" | "timeout";
-  subscribed: boolean;
-  unsubscribed: boolean;
+  /** The server sent notifications/subscriptions/acknowledged for our listen request. */
+  listenAcknowledged: boolean;
+  /** The resource URIs the server actually honored, taken from the acknowledgement. */
+  honoredUris: string[];
+  /**
+   * How the listen stream ended:
+   * - "local"    — this probe closed it (the normal path)
+   * - "graceful" — the server ended it deliberately (empty listen response)
+   * - "remote"   — the stream dropped without a response (abnormal disconnect)
+   */
+  closeReason: "local" | "graceful" | "remote" | null;
   errorCode: string | null;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const RESOURCE_UPDATED_METHOD = "notifications/resources/updated";
+/**
+ * SDK v2 は SEP-2549 の cache hint を尊重し、既定の `cacheMode: "use"` では
+ * まだ fresh な同一 URI のキャッシュをラウンドトリップ無しで返す。キャッシュの
+ * eviction 契機は `notifications/resources/updated` の受信なので、通知が来ない
+ * 経路（pre-completion 判定の読み直し）では効かず、サーバーが `ttlMs > 0` を
+ * 返すと probe が古い内容を現在値として報告してしまう。probe は常に実サーバーの
+ * 現在値を観測するのが契約なので、cacheable verb は明示的に bypass する。
+ */
+const UNCACHED: { cacheMode: "bypass" } = { cacheMode: "bypass" };
 const NON_TERMINAL_RECOMMENDED_ACTIONS = new Set(["POLL_AFTER"]);
+
+/** Thrown into a pending notification wait when the listen stream ends first. */
+class SubscriptionClosedError extends Error {
+  constructor(readonly reason: "local" | "graceful" | "remote") {
+    super(`subscriptions/listen stream closed (${reason})`);
+    this.name = "SubscriptionClosedError";
+  }
+}
 
 function getResourceText(result: Awaited<ReturnType<Client["readResource"]>>): string {
   const first = result.contents[0];
@@ -66,6 +92,12 @@ interface ResourceUpdateQueue {
   readonly receivedCount: number;
   readonly lastUri: string;
   readonly waitAfter: (sequence: number, timeoutMs: number) => Promise<ResourceUpdateEvent>;
+  /**
+   * Marks the stream as dead — used when the listen stream ends before an
+   * update arrives. Rejects the pending wait and every later one, so a close
+   * that lands between two waits is still reported as a disconnect.
+   */
+  readonly fail: (error: Error) => void;
   readonly cancel: () => void;
 }
 
@@ -73,6 +105,7 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
   const events: ResourceUpdateEvent[] = [];
   let receivedCount = 0;
   let lastUri = "";
+  let failure: Error | null = null;
   let pending: {
     afterSequence: number;
     resolve: (event: ResourceUpdateEvent) => void;
@@ -83,7 +116,7 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
   const findNextEvent = (sequence: number): ResourceUpdateEvent | undefined =>
     events.find((event) => event.sequence > sequence);
 
-  client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
+  client.setNotificationHandler(RESOURCE_UPDATED_METHOD, (notification) => {
     if (notification.params.uri !== uri) {
       return;
     }
@@ -118,6 +151,13 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
         return Promise.resolve(existing);
       }
 
+      // 待機の合間に stream が閉じた場合、この時点で pending は存在しないため
+      // fail() は誰も落とせない。閉じた事実をここで持ち回り、以降の待機を
+      // 新しいタイマーで待たせずに切断として即座に落とす。
+      if (failure) {
+        return Promise.reject(failure);
+      }
+
       if (timeoutMs <= 0) {
         return Promise.reject(new Error("Timed out waiting for resource update notification"));
       }
@@ -137,6 +177,15 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
           timeout,
         };
       });
+    },
+    fail: (error: Error) => {
+      failure ??= error;
+      if (pending) {
+        const waiter = pending;
+        pending = null;
+        clearTimeout(waiter.timeout);
+        waiter.reject(error);
+      }
     },
     cancel: () => {
       if (pending) {
@@ -196,28 +245,39 @@ function shouldWaitForNextUpdate(text: string): boolean {
   return action !== null && NON_TERMINAL_RECOMMENDED_ACTIONS.has(action);
 }
 
+/** Maps a failed wait to an error code, distinguishing a dead stream from a quiet one. */
+function classifyWaitFailure(error: unknown): string {
+  if (error instanceof SubscriptionClosedError) {
+    return error.reason === "remote" ? "SUBSCRIPTION_DISCONNECTED" : "SUBSCRIPTION_CLOSED";
+  }
+  return "NOTIFICATION_TIMEOUT";
+}
+
 export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise<SubscribeProbeResult> {
   const uri = options.uri ?? REVIEW_STATUS_URI;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const client = new Client({
-    name: options.clientName ?? "mcp-resource-subscribe-probe-client",
-    // 実バージョンは呼び出し元（cli.ts が package.json から解決）が渡す。
-    // 未指定のライブラリ利用では、古い実バージョンを騙るよりプレースホルダを名乗る。
-    version: options.clientVersion ?? "0.0.0",
-  });
+  const client = new Client(
+    {
+      name: options.clientName ?? "mcp-resource-subscribe-probe-client",
+      // 実バージョンは呼び出し元（cli.ts が package.json から解決）が渡す。
+      // 未指定のライブラリ利用では、古い実バージョンを騙るよりプレースホルダを名乗る。
+      version: options.clientVersion ?? "0.0.0",
+    },
+    PINNED_CLIENT_OPTIONS,
+  );
 
   try {
     const transport = new StreamableHTTPClientTransport(new URL(options.url), {
       requestInit: options.requestHeaders ? { headers: options.requestHeaders } : undefined,
     });
-    await client.connect(transport);
+    await connectPinned(client, transport);
 
     const capabilities = client.getServerCapabilities()?.resources ?? null;
     let resourceFound: boolean;
     if (options.skipResourceListCheck) {
       resourceFound = true;
     } else {
-      const resources = await client.listResources();
+      const resources = await client.listResources(undefined, UNCACHED);
       resourceFound = resources.resources.some((resource) => resource.uri === uri);
       if (!resourceFound) {
         return {
@@ -228,30 +288,30 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
           finalText: "",
           notificationCount: 0,
           route: "timeout",
-          subscribed: false,
-          unsubscribed: false,
+          listenAcknowledged: false,
+          honoredUris: [],
+          closeReason: null,
           errorCode: "RESOURCE_NOT_FOUND",
         };
       }
     }
 
-    const initial = await client.readResource({ uri });
+    const initial = await client.readResource({ uri }, UNCACHED);
     const initialText = getResourceText(initial);
     const notifications = createResourceUpdateQueue(client, uri);
-    let subscribed = false;
-    let unsubscribed = false;
     let notificationUri = "";
     let notificationSequence = 0;
     let finalText = "";
     let errorCode: string | null = null;
     let route: "subscription" | "pre-completion" | "timeout" = "timeout";
+    let closeReason: "local" | "graceful" | "remote" | null = null;
     const deadlineMs = Date.now() + timeoutMs;
 
     const remainingMs = (): number => Math.max(0, deadlineMs - Date.now());
 
+    let subscription: McpSubscription;
     try {
-      await client.subscribeResource({ uri });
-      subscribed = true;
+      subscription = await client.listen({ resourceSubscriptions: [uri] }, { timeout: remainingMs() });
     } catch {
       notifications.cancel();
       return {
@@ -262,26 +322,57 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
         finalText: "",
         notificationCount: 0,
         route: "timeout",
-        subscribed: false,
-        unsubscribed: false,
+        listenAcknowledged: false,
+        honoredUris: [],
+        closeReason: null,
         errorCode: "SUBSCRIPTION_FAILED",
       };
     }
 
-    // Wrap all post-subscribe operations in a single try/finally so that
-    // notifications.cancel() and unsubscribeResource() always run — even when
-    // the post-subscribe read (pre-completion check) or the final read throws.
+    const honoredUris = subscription.honoredFilter.resourceSubscriptions ?? [];
+    // 切断は待ち受け中の wait を即座に落とす。応答なしの終了は異常切断であり、
+    // timeout まで黙って待ち続けてよいものではない。
+    void subscription.closed.then((reason) => {
+      closeReason = reason;
+      if (reason !== "local") {
+        notifications.fail(new SubscriptionClosedError(reason));
+      }
+    });
+
+    // ack は server が実際に honor した filter のサブセット。要求した URI が
+    // 欠けていれば通知は永久に来ないため、待ち続けず明示的なエラーとして返す。
+    if (!honoredUris.includes(uri)) {
+      await subscription.close().catch(() => undefined);
+      notifications.cancel();
+      return {
+        capabilities,
+        resourceFound: true,
+        initialText,
+        notificationUri: "",
+        finalText: "",
+        notificationCount: 0,
+        route: "timeout",
+        listenAcknowledged: true,
+        honoredUris,
+        closeReason,
+        errorCode: "SUBSCRIPTION_NOT_HONORED",
+      };
+    }
+
+    // Wrap all post-listen operations in a single try/finally so that
+    // notifications.cancel() and subscription.close() always run — even when
+    // the post-listen read (pre-completion check) or the final read throws.
     try {
-      const postSubscribeReadAfterSequence = notifications.receivedCount;
-      // Immediately read once after subscribe to handle the pre-completion race condition:
-      // if the resource was already updated before our subscription was established
-      // (i.e., the notification fired before we subscribed), we will never receive
-      // that notification. Comparing with initialText detects this window.
-      const postSubscribeText = getResourceText(await client.readResource({ uri }));
-      notificationSequence = postSubscribeReadAfterSequence;
-      if (postSubscribeText !== initialText) {
-        finalText = postSubscribeText;
-        if (notifications.receivedCount > postSubscribeReadAfterSequence) {
+      const postListenReadAfterSequence = notifications.receivedCount;
+      // Immediately read once after the acknowledgement to handle the
+      // pre-completion race condition: if the resource was already updated
+      // before our subscription was acknowledged, we will never receive that
+      // notification. Comparing with initialText detects this window.
+      const postListenText = getResourceText(await client.readResource({ uri }, UNCACHED));
+      notificationSequence = postListenReadAfterSequence;
+      if (postListenText !== initialText) {
+        finalText = postListenText;
+        if (notifications.receivedCount > postListenReadAfterSequence) {
           route = "subscription";
           notificationUri = notifications.lastUri;
         } else if (!shouldWaitForNextUpdate(finalText)) {
@@ -294,12 +385,12 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
             notificationSequence = event.sequence;
             notificationUri = event.uri;
             route = "subscription";
-          } catch {
-            errorCode = "NOTIFICATION_TIMEOUT";
+          } catch (error) {
+            errorCode = classifyWaitFailure(error);
             break;
           }
 
-          finalText = getResourceText(await client.readResource({ uri }));
+          finalText = getResourceText(await client.readResource({ uri }, UNCACHED));
         }
       } else {
         try {
@@ -307,34 +398,30 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
           notificationSequence = event.sequence;
           notificationUri = event.uri;
           route = "subscription";
-        } catch {
-          errorCode = "NOTIFICATION_TIMEOUT";
+        } catch (error) {
+          errorCode = classifyWaitFailure(error);
         }
 
         if (route === "subscription") {
-          finalText = getResourceText(await client.readResource({ uri }));
+          finalText = getResourceText(await client.readResource({ uri }, UNCACHED));
           while (shouldWaitForNextUpdate(finalText) && !errorCode) {
             try {
               const event = await notifications.waitAfter(notificationSequence, remainingMs());
               notificationSequence = event.sequence;
               notificationUri = event.uri;
-            } catch {
-              errorCode = "NOTIFICATION_TIMEOUT";
+            } catch (error) {
+              errorCode = classifyWaitFailure(error);
               break;
             }
 
-            finalText = getResourceText(await client.readResource({ uri }));
+            finalText = getResourceText(await client.readResource({ uri }, UNCACHED));
           }
         }
       }
     } finally {
       notifications.cancel();
-      try {
-        await client.unsubscribeResource({ uri });
-        unsubscribed = true;
-      } catch {
-        // ignore unsubscribe errors
-      }
+      // 2026-07-28 に resources/unsubscribe RPC は存在しない。stream を閉じることが解除。
+      await subscription.close().catch(() => undefined);
     }
 
     return {
@@ -345,8 +432,9 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
       finalText,
       notificationCount: notifications.receivedCount,
       route,
-      subscribed,
-      unsubscribed,
+      listenAcknowledged: true,
+      honoredUris,
+      closeReason,
       errorCode,
     };
   } finally {

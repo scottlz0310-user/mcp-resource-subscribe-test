@@ -4,8 +4,8 @@
 
 本リポジトリは、MCP `resources/subscribe` の**互換性検証スパイク**として開始した。CLI AI エージェント（Codex, Gemini, Claude Code, Crush 等）が MCP resource subscription を正しく処理できるかを、再現可能な形でテストするためのものである。この検証フェーズは既に完了しており、現在は以下の 2 つの実運用向けコンポーネントを提供する:
 
-1. **CLI probe**（`mcp-resource-subscriber`、`src/client/cli.ts`）— CLI エージェントのワークフローや外部ツール（例: `squirrel-notifier`）が、MCP resource を subscribe して `notifications/resources/updated` を待ち、結果を構造化された stdout/JSON として報告させるために呼び出す、公開済みのサブプロセス。mcp-gateway 向け認証（`--login` / `--logout`、キャッシュ済みトークンの自動更新）も担い、これらの呼び出し元がトークンを手動で用意する必要をなくす。`call` サブコマンド（`--tool` / `--args`）は、subscribe とは別に任意の MCP tool を単発 `tools/call` 呼び出しして即終了するモードで、同じ認証経路を再利用する（#111）。
-2. **リファレンス MCP Streamable HTTP サーバー**（`src/server/`）— クライアントが subscribe した後に更新される 1 つの resource（`test://review/status`）を公開し、`notifications/resources/updated` を送信する。probe クライアントのローカル / Docker テスト用に維持されており、本番トラフィック向けではない。
+1. **CLI probe**（`mcp-resource-subscriber`、`src/client/cli.ts`）— CLI エージェントのワークフローや外部ツール（例: `squirrel-notifier`）が、MCP resource を subscribe して `notifications/resources/updated` を待ち、結果を構造化された stdout/JSON として報告させるために呼び出す、公開済みのサブプロセス。**protocol revision は `2026-07-28` に pin しており、legacy へフォールバックしない**（#162）。mcp-gateway 向け認証（`--login` / `--logout`、キャッシュ済みトークンの自動更新）も担い、これらの呼び出し元がトークンを手動で用意する必要をなくす。`call` サブコマンド（`--tool` / `--args`）は、subscribe とは別に任意の MCP tool を単発 `tools/call` 呼び出しして即終了するモードで、同じ認証経路を再利用する（#111）。
+2. **リファレンス MCP Streamable HTTP サーバー**（`src/server/`）— stateless（`legacy: "reject"`）。1 つの resource（`test://review/status`）を公開し、`subscriptions/listen` の stream 開通を起点に更新をシミュレートして、その stream へ `notifications/resources/updated` を配信する。probe クライアントのローカル / Docker テスト用に維持されており、本番トラフィック向けではない。
 
 ## 必須コマンド
 
@@ -33,12 +33,13 @@ src/
   server/
     index.ts         — エントリポイント: 環境設定を読み込み、Express HTTP サーバーを起動
     config.ts        — TestConfig 型 + configFromEnv()（全環境変数をここでパース）
-    httpServer.ts    — createMcpHttpApp(): McpServer を StreamableHTTP transport 経由で Express に接続
-    mcpServer.ts     — createProbeServer(): MCP ハンドラを登録（list/read/subscribe/unsubscribe + tool）
+    httpServer.ts    — createMcpHttpApp(): createMcpHandler（legacy: "reject"）+ toNodeHandler を Express にマウントし、{ app, close } を返す。resource の状態と更新シミュレーションは McpServer がリクエストごとに作り直されるためここ（アプリスコープ）に置く。InMemoryServerEventBus をラップした自前 bus を渡し、listen stream の開閉を観測して更新タイマーを張る
+    mcpServer.ts     — createProbeServer(): MCP ハンドラを登録（list/read + tool）。2026-07-28 に resources/subscribe RPC は無く、通知配信は handler.notify.resourceUpdated() が担う
     resourceState.ts — ReviewStatusStore（in-memory、version 1→2）、renderReviewStatus()、定数
     logger.ts        — createConsoleLogger(config): logLevel が 'silent' でない限り全行を出力する LogSink を返す（レベル階層フィルタなし）
   client/
-    probeClient.ts   — runSubscribeProbe(): 全フローを実行し型付き結果を返す SDK クライアント
+    probeClient.ts   — runSubscribeProbe(): 全フローを実行し型付き結果を返す SDK クライアント（subscriptions/listen → ack 検証 → 通知待機 → 再 read → stream close）
+    protocolNegotiation.ts — protocol revision を 2026-07-28 に pin する Client オプションと connectPinned()。negotiation 失敗を ProtocolNegotiationError に正規化する（ネットワーク起因は素通し）
     callClient.ts    — runToolCall(): call サブコマンド用、単発 tools/call を実行し型付き結果を返す SDK クライアント
     callJsonOutput.ts — call サブコマンドの --json 出力スキーマ（CallJsonOutput）
     cli.ts           — 公開 bin エントリ; --url, --uri, --auth-token, --login, --logout, --skip-resource-list-check, --timeout-ms に加え `call` サブコマンド（--tool, --args）をサポート
@@ -66,11 +67,11 @@ test/
 
 **サーバー/クライアント二重構成のリポジトリ**: `src/server/`（サーバー）と `src/client/`（クライアント）はどちらも第一級の存在。サーバーは Docker / 手動テスト用であり、probe クライアントはパッケージ内に公開され（`dist/src/client/probeClient.js`）、CLI bin は `dist/src/client/cli.js`。
 
-**`createProbeServer()` は subscribe 時のみ更新をトリガーする**: `scheduleUpdate()` は `SubscribeRequestSchema` ハンドラ内で呼ばれる。タイマーは `updateDelaySeconds` 秒後に発火する。テストではこれを `0.05` に設定して高速化している — テストで本番デフォルト（5秒）を使わないこと。
+**更新シミュレーションの起点は `subscriptions/listen` の stream 開通**: `createMcpHttpApp()` は自前の `ServerEventBus` を `createMcpHandler` に渡し、listen stream ごとの listener 登録を観測している。2026-07-28 に `resources/subscribe` RPC は無いため、これが「クライアントが通知を待ち始めた」ことを server 側から観測できる唯一の点。stream が 0 → 1 になったところで `scheduleUpdate()` がタイマーを張り、`updateDelaySeconds` 秒後に発火する。テストではこれを `0.05` に設定して高速化している — テストで本番デフォルト（5秒）を使わないこと。read を起点にすると通知の発行時点で stream が開いておらず通知が失われうる（`InMemoryServerEventBus` はバッファせず、その時点の listener にのみ同期配信する）。
 
-**Subscription セットは in-memory かつサーバーインスタンス単位**: `subscriptions` は各 `createProbeServer()` 呼び出しにローカルな `Set<string>`。各テストはポート 0 で新しいサーバーインスタンスを作成する。
+**購読サイクルの境界は「listen stream が 1 本も無い状態での `resources/read`」**: そこで `ReviewStatusStore.reset()` が走り、状態が version 1 に戻る。`store` は handler の外（アプリスコープ）にあり probe をまたいで生き残るため、これが無いと同じサーバープロセスに対する 2 回目以降の probe が更新を観測できない。
 
-**`McpServer` と `McpServer.server` の違い**: SDK の `McpServer`（高レベル）は低レベルの `server` プロパティをラップしている。`registerTool()` は高レベルラッパー上にあるが、resources/subscribe/unsubscribe 用の `setRequestHandler()` は高レベル API が公開していないため `.server` を直接呼び出す必要がある。`sendResourceUpdated()` も `.server` 上にある。
+**`McpServer` と `McpServer.server` の違い**: SDK の `McpServer`（高レベル）は低レベルの `server` プロパティをラップしている。`registerTool()` は高レベルラッパー上にあるが、`resources/list` / `resources/read` 用の `setRequestHandler()` は高レベル API が公開していないため `.server` を直接呼び出す必要がある。通知の配信は `.server` ではなく `handler.notify.resourceUpdated()`（`createMcpHandler` が返す `ServerNotifier`）が担う。
 
 **import は `.js` 拡張子を使う**: TypeScript は `moduleResolution: NodeNext` でコンパイルされる。`.ts` ソースファイル内であっても、相対 import はすべて `.js` で終える必要がある。
 
@@ -107,10 +108,11 @@ test/
 
 テスト設定内の `updateDelaySeconds: 0.05` は重要 — テスト内の通知タイムアウトは 2000ms なので余裕があるが、本番のディレイ（5秒）ではテストが遅くなる。
 
-3 つのテストケース:
+主なテストケース:
 1. `get_review_status` ツールが list され、呼び出し可能であること
-2. subscribe→notify→re-read の全フローをログアサーション付きで検証
+2. listen→notify→re-read の全フローをログアサーション付きで検証
 3. `runSubscribeProbe()` probe クライアントをエンドツーエンドで検証
+4. 同じサーバープロセスに対する probe の連続実行（購読サイクルのリセット）
 
 **Gateway auth テスト**（`tokenStore.test.ts` / `oauthClient.test.ts` / `gatewayAuth.test.ts` / `cliAuth.test.ts`、計 30 ケース超）は、`helpers/mockAuthServer.ts`（mcp-gateway の OAuth surface を模した in-process Express モック）に対して OAuth device flow・トークンキャッシュ・refresh/rotation・CLI サブプロセスの挙動を検証する。`cliAuth.test.ts` は接続は受け付けるが応答しない生の `node:http` サーバーも起動し、`AUTH_TIMEOUT` を検証する。
 

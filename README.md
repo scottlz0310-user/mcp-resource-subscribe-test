@@ -1,6 +1,8 @@
 # mcp-resource-subscriber
 
-CLI probe for MCP `resources/subscribe` — connects to any MCP Streamable HTTP server, subscribes to a resource, receives live update notifications, and re-reads updated content.
+CLI probe for MCP resource subscriptions — connects to any MCP Streamable HTTP server, opens a `subscriptions/listen` stream for a resource, receives live update notifications, and re-reads updated content.
+
+> **Protocol**: this CLI speaks MCP protocol revision **`2026-07-28` only**. It pins negotiation to that revision and never falls back to the 2025-era `resources/subscribe` path — a server that cannot offer `2026-07-28` fails with `PROTOCOL_UNSUPPORTED`.
 
 ---
 
@@ -148,10 +150,11 @@ Success output:
   "route": "subscription",
   "serverUrl": "http://localhost:3000/mcp",
   "resourceUri": "queue://review/re-review-requests",
-  "subscribed": true,
+  "listenAcknowledged": true,
+  "honoredUris": ["queue://review/re-review-requests"],
   "notificationReceived": true,
   "notificationCount": 1,
-  "unsubscribed": true,
+  "closeReason": "local",
   "errorCode": null,
   "initialText": "...",
   "finalText": "...",
@@ -166,10 +169,11 @@ Failure output (same shape with non-null `errorCode`):
   "route": "timeout",
   "serverUrl": "http://localhost:3000/mcp",
   "resourceUri": "queue://review/re-review-requests",
-  "subscribed": true,
+  "listenAcknowledged": true,
+  "honoredUris": ["queue://review/re-review-requests"],
   "notificationReceived": false,
   "notificationCount": 0,
-  "unsubscribed": true,
+  "closeReason": "local",
   "errorCode": "NOTIFICATION_TIMEOUT",
   "initialText": null,
   "finalText": null,
@@ -178,6 +182,9 @@ Failure output (same shape with non-null `errorCode`):
 ```
 
 - `route`: `"subscription"` | `"pre-completion"` | `"timeout"` | `"failed"`
+- `listenAcknowledged`: `true` once the server answered `subscriptions/listen` with `notifications/subscriptions/acknowledged`
+- `honoredUris`: the resource URIs the server actually honored, taken from that acknowledgement. A requested URI missing here fails with `SUBSCRIPTION_NOT_HONORED` instead of waiting for a notification that can never arrive
+- `closeReason`: how the listen stream ended — `"local"` (this CLI closed it), `"graceful"` (the server ended it deliberately), `"remote"` (dropped without a response — reported as `SUBSCRIPTION_DISCONNECTED`), or `null`
 - `notificationReceived`: `true` when `route === "subscription"`
 - `recommendedNextAction`: extracted from `finalText` if present, otherwise `null`. On network-level failures (`TLS_CERT_UNTRUSTED`, `DNS_LOOKUP_FAILED`, `CONNECTION_REFUSED`) this is instead a client-generated remediation hint — see [Network error classification](#network-error-classification) below.
 - If `finalText` is JSON, callers can parse it themselves
@@ -212,7 +219,7 @@ without parsing stdout:
 | `0` | Success | — |
 | `1` | Tool-level error (the tool ran and returned `isError: true`) | `TOOL_ERROR` |
 | `2` | Auth error | `AUTH_LOGIN_REQUIRED`, `AUTH_TIMEOUT`, `AUTH_REFRESH_FAILED`, `AUTH_FAILED` |
-| `3` | Communication / usage error | `SERVER_URL_UNKNOWN`, `TOOL_NAME_REQUIRED`, `INVALID_ARGS`, `CALL_FAILED`, `INTERNAL_ERROR`, `TLS_CERT_UNTRUSTED`, `DNS_LOOKUP_FAILED`, `CONNECTION_REFUSED` |
+| `3` | Communication / usage / protocol error | `SERVER_URL_UNKNOWN`, `TOOL_NAME_REQUIRED`, `INVALID_ARGS`, `TOOL_REQUEST_REJECTED`, `PROTOCOL_UNSUPPORTED`, `CALL_FAILED`, `INTERNAL_ERROR`, `TLS_CERT_UNTRUSTED`, `DNS_LOOKUP_FAILED`, `CONNECTION_REFUSED` |
 
 `--json` output shape:
 
@@ -237,27 +244,28 @@ success and error outcomes, so machine parsers can rely on a single shape:
 error); `recommended-next-action` is `null` except on network-level errors
 (see [Network error classification](#network-error-classification)).
 
-> **Note**: an MCP server may itself report "unknown tool name" as a normal
-> tool result with `isError: true` rather than a protocol-level failure (this
-> is what the MCP SDK's reference server implementation does) — such cases
-> surface as exit code `1` / `TOOL_ERROR`, not `3` / `CALL_FAILED`.
+> **Note**: an unknown tool name (and invalid arguments) is rejected by the
+> server before the tool runs, so it surfaces as exit code `3` /
+> `TOOL_REQUEST_REJECTED` — not `1` / `TOOL_ERROR`, which is reserved for a
+> tool that ran and returned `isError: true`.
 
 ### Structured line-based output (default)
 
 Every run emits machine-parseable lines:
 
 ```
-capabilities {"subscribe":true,"listChanged":true}
+capabilities {"subscribe":true,"listChanged":false}
 resource-found true
 resource-uri <resource-uri>
 server-url <url>
 initial
 <initial resource text>
 route subscription
-subscribed true
+listen-acknowledged true
+honored-uris ["<resource-uri>"]
 notification-received true
 notification-count 1
-unsubscribed true
+close-reason local
 recommended_next_action READ_REVIEW_THREADS
 error-code null
 notification <resource-uri>
@@ -268,7 +276,7 @@ phase-summary route=subscription url=<url> uri=<uri>
 
 > **Note**: `recommended_next_action` is only emitted when the final resource text contains it (e.g., from `copilot-review-mcp`). It is omitted for the bundled test server.
 
-`recommended_next_action=POLL_AFTER` は非終端状態として扱われます。この場合、CLI は exit せず、同じ購読を維持したまま次の `notifications/resources/updated` を待ちます。`--timeout-ms` は subscribe 後の全体待機上限です。
+`recommended_next_action=POLL_AFTER` は非終端状態として扱われます。この場合、CLI は exit せず、同じ `subscriptions/listen` stream を維持したまま次の `notifications/resources/updated` を待ちます。`--timeout-ms` は ack 後の全体待機上限です。
 
 On failure:
 
@@ -285,6 +293,12 @@ phase-summary route=timeout url=<url> uri=<uri> error-code=RESOURCE_NOT_FOUND
 ```
 error-code NOTIFICATION_TIMEOUT
 phase-summary route=timeout url=<url> uri=<uri> error-code=NOTIFICATION_TIMEOUT
+```
+
+```
+error-code PROTOCOL_UNSUPPORTED
+recommended-next-action The server does not offer MCP protocol revision 2026-07-28. ...
+phase-summary route=failed url=<url> uri=<uri> error-code=PROTOCOL_UNSUPPORTED
 ```
 
 ### Network error classification
@@ -304,7 +318,7 @@ and `call` mode (`--json` and line-based `recommended-next-action <text>`):
 
 ## Lab Server
 
-Minimal MCP Streamable HTTP server for testing whether MCP clients correctly handle `resources/subscribe` and `notifications/resources/updated`.
+Minimal MCP Streamable HTTP server for testing whether MCP clients correctly handle `subscriptions/listen` and `notifications/resources/updated`.
 
 This repository is meant to be a reproducible issue / compatibility lab for CLI AI agents such as Codex CLI, Gemini CLI, OpenCode, GitHub Copilot CLI, Claude Code, Goose, and Crush.
 
@@ -324,7 +338,7 @@ version: 1
 message: Waiting for simulated review result.
 ```
 
-After a client subscribes to the resource, the server waits for `MCP_TEST_UPDATE_DELAY_SECONDS`, changes the resource, and sends:
+After a client opens a `subscriptions/listen` stream for the resource, the server waits for `MCP_TEST_UPDATE_DELAY_SECONDS`, changes the resource, and sends:
 
 ```json
 {
@@ -343,7 +357,7 @@ version: 2
 message: Simulated review result is now available.
 ```
 
-## Why Resources/Subscribe Instead Of Tools/Call
+## Why Resource Subscriptions Instead Of Tools/Call
 
 `tools/call` is useful for explicit actions, but many agent workflows depend on context that changes after the original request. Polling every source is noisy and client-specific. MCP resource subscriptions give clients a protocol-level way to learn that a known context object changed and should be re-read.
 
@@ -398,20 +412,28 @@ If `MCP_TEST_SEND_LIST_CHANGED=true`, the server also sends `notifications/resou
 An ideal MCP client should follow this flow:
 
 ```text
-initialize
+server/discover                       (negotiate 2026-07-28)
   ↓
 resources/list
   ↓
 resources/read test://review/status
   ↓
-resources/subscribe test://review/status
+subscriptions/listen { notifications: { resourceSubscriptions: ["test://review/status"] } }
   ↓
-receive notifications/resources/updated
+receive notifications/subscriptions/acknowledged   (MUST arrive first; check the honored filter)
+  ↓
+receive notifications/resources/updated            (on the same long-lived SSE stream)
   ↓
 resources/read test://review/status again
   ↓
 reflect updated status: reviewed in agent context
+  ↓
+close the stream                       (there is no resources/unsubscribe in 2026-07-28)
 ```
+
+The server has no protocol-level session: the subscription lives exactly as long
+as the `subscriptions/listen` HTTP request. A stream that ends without a
+response is an abnormal disconnect, not a clean unsubscribe.
 
 ## Server Capabilities
 
@@ -421,20 +443,24 @@ The initialize response advertises:
 {
   "resources": {
     "subscribe": true,
-    "listChanged": true
+    "listChanged": false
   }
 }
 ```
 
+`listChanged` follows `MCP_TEST_SEND_LIST_CHANGED`. `subscribe: true` now means
+"individual resource updates can be requested through `resourceSubscriptions`",
+not that `resources/subscribe` exists.
+
 ## Implemented MCP Messages
 
-- `initialize`
+- `server/discover` (`2026-07-28` only — a 2025-era `initialize` is rejected with `-32022`)
 - `resources/list`
 - `resources/read`
-- `resources/subscribe`
-- `resources/unsubscribe`
+- `subscriptions/listen` + `notifications/subscriptions/acknowledged`
 - `notifications/resources/updated`
 - `notifications/resources/list_changed` when `MCP_TEST_SEND_LIST_CHANGED=true`
+- GET / DELETE on the MCP endpoint answer `405`: the standalone GET SSE endpoint and `Mcp-Session-Id` sessions no longer exist
 - `tools/list`, `tools/call`:
   - `get_review_status` — returns the current review status (same data as reading `test://review/status`)
   - `echo_tool` — testing utility for `call` mode; echoes `{ message }` back as text content, or returns `isError: true` when called with `{ shouldError: true }`
@@ -444,21 +470,18 @@ The initialize response advertises:
 The server logs each important message so client behavior can be checked objectively:
 
 ```text
-[initialize] client connected
 [resources/list] requested
 [resources/read] uri=test://review/status version=1
-[resources/subscribe] uri=test://review/status
 [resource/update] uri=test://review/status version=2
 [notification/send] notifications/resources/updated uri=test://review/status
 [resources/read] uri=test://review/status version=2
-[resources/unsubscribe] uri=test://review/status
 ```
 
 The key evidence for resource subscription support is:
 
 ```text
-resources/subscribe was received
-notification was sent
+subscriptions/listen was acknowledged
+notification was sent on that stream
 resources/read was received again after the notification
 ```
 
@@ -472,9 +495,10 @@ The test suite verifies:
 
 - `resources/list` returns `test://review/status`
 - initial `resources/read` returns version 1
-- `resources/subscribe` triggers an internal update to version 2
+- opening a `subscriptions/listen` stream triggers an internal update to version 2
 - `notifications/resources/updated` is received
 - updated `resources/read` returns version 2
+- repeated probes against the same server process each observe the update
 
 ## Standalone Subscription Probe Client
 
@@ -490,7 +514,7 @@ After `pnpm run build`, the same client can be run directly with Node:
 node dist/src/client/cli.js --url http://127.0.0.1:8089/mcp
 ```
 
-This client is separate from any AI client's native MCP surface. For Codex CLI, it demonstrates a reproducible agent-driven SDK workaround: if the agent has shell, Node.js, local dependency, and localhost network access, it can run this client to call `resources/subscribe`, receive `notifications/resources/updated`, and re-read the updated resource.
+This client is separate from any AI client's native MCP surface. For Codex CLI, it demonstrates a reproducible agent-driven SDK workaround: if the agent has shell, Node.js, local dependency, and localhost network access, it can run this client to open a `subscriptions/listen` stream, receive `notifications/resources/updated`, and re-read the updated resource.
 
 ## Verification Procedure
 
@@ -498,9 +522,16 @@ Use [`docs/verification-guide.md`](docs/verification-guide.md) for a repeatable 
 
 Record results in [`results/compatibility-matrix.md`](results/compatibility-matrix.md).
 
+> **Historical**: the verification guides and the compatibility matrices under
+> [`results/`](results) were produced against the 2025-era protocol, before this repository
+> moved to `2026-07-28`. Their `resources/subscribe` / `resources/unsubscribe` steps no
+> longer apply to the server described above — the flow is now the one in
+> [Expected Client Behavior](#expected-client-behavior). They are kept as a record of the
+> compatibility spike, not as instructions to follow.
+
 ## Skill Templates
 
-Reusable Codex skill templates are tracked under [`docs/skills`](docs/skills). The `pr-review-subscribe` template documents a PR review cycle that uses MCP `resources/subscribe` as the primary wait route and polling only as fallback.
+Reusable Codex skill templates are tracked under [`docs/skills`](docs/skills). The `pr-review-subscribe` template documents a PR review cycle that uses an MCP resource subscription as the primary wait route and polling only as fallback. It predates the `2026-07-28` migration and still describes the 2025-era `resources/subscribe` wire calls; the wait strategy carries over, the RPC names do not.
 
 ## Client Compatibility
 

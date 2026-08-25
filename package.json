@@ -1,11 +1,11 @@
 {
   "name": "mcp-resource-subscriber",
   "version": "0.5.0",
-  "description": "CLI probe for MCP resource subscriptions — subscribe to MCP resources, receive live update notifications, and re-read updated content.",
+  "description": "CLI probe for MCP resource subscriptions (protocol revision 2026-07-28) — open a subscriptions/listen stream, receive live update notifications, and re-read updated content.",
   "keywords": [
     "mcp",
     "model-context-protocol",
-    "resources-subscribe",
+    "subscriptions-listen",
     "mcp-client",
     "cli",
     "probe",
@@ -44,11 +44,14 @@
     "prepare": "lefthook install || true"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/core": "^2.0.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.10",
+    "@modelcontextprotocol/node": "^2.0.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "@types/express": "^5.0.6",
     "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.11",
