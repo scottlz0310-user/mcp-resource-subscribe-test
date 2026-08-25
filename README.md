@@ -318,7 +318,7 @@ and `call` mode (`--json` and line-based `recommended-next-action <text>`):
 
 ## Lab Server
 
-Minimal MCP Streamable HTTP server for testing whether MCP clients correctly handle `resources/subscribe` and `notifications/resources/updated`.
+Minimal MCP Streamable HTTP server for testing whether MCP clients correctly handle `subscriptions/listen` and `notifications/resources/updated`.
 
 This repository is meant to be a reproducible issue / compatibility lab for CLI AI agents such as Codex CLI, Gemini CLI, OpenCode, GitHub Copilot CLI, Claude Code, Goose, and Crush.
 
@@ -338,7 +338,7 @@ version: 1
 message: Waiting for simulated review result.
 ```
 
-After a client subscribes to the resource, the server waits for `MCP_TEST_UPDATE_DELAY_SECONDS`, changes the resource, and sends:
+After a client opens a `subscriptions/listen` stream for the resource, the server waits for `MCP_TEST_UPDATE_DELAY_SECONDS`, changes the resource, and sends:
 
 ```json
 {
@@ -470,21 +470,18 @@ not that `resources/subscribe` exists.
 The server logs each important message so client behavior can be checked objectively:
 
 ```text
-[initialize] client connected
 [resources/list] requested
 [resources/read] uri=test://review/status version=1
-[resources/subscribe] uri=test://review/status
 [resource/update] uri=test://review/status version=2
 [notification/send] notifications/resources/updated uri=test://review/status
 [resources/read] uri=test://review/status version=2
-[resources/unsubscribe] uri=test://review/status
 ```
 
 The key evidence for resource subscription support is:
 
 ```text
-resources/subscribe was received
-notification was sent
+subscriptions/listen was acknowledged
+notification was sent on that stream
 resources/read was received again after the notification
 ```
 
@@ -498,9 +495,10 @@ The test suite verifies:
 
 - `resources/list` returns `test://review/status`
 - initial `resources/read` returns version 1
-- `resources/subscribe` triggers an internal update to version 2
+- opening a `subscriptions/listen` stream triggers an internal update to version 2
 - `notifications/resources/updated` is received
 - updated `resources/read` returns version 2
+- repeated probes against the same server process each observe the update
 
 ## Standalone Subscription Probe Client
 
@@ -516,7 +514,7 @@ After `pnpm run build`, the same client can be run directly with Node:
 node dist/src/client/cli.js --url http://127.0.0.1:8089/mcp
 ```
 
-This client is separate from any AI client's native MCP surface. For Codex CLI, it demonstrates a reproducible agent-driven SDK workaround: if the agent has shell, Node.js, local dependency, and localhost network access, it can run this client to call `resources/subscribe`, receive `notifications/resources/updated`, and re-read the updated resource.
+This client is separate from any AI client's native MCP surface. For Codex CLI, it demonstrates a reproducible agent-driven SDK workaround: if the agent has shell, Node.js, local dependency, and localhost network access, it can run this client to open a `subscriptions/listen` stream, receive `notifications/resources/updated`, and re-read the updated resource.
 
 ## Verification Procedure
 
@@ -524,9 +522,16 @@ Use [`docs/verification-guide.md`](docs/verification-guide.md) for a repeatable 
 
 Record results in [`results/compatibility-matrix.md`](results/compatibility-matrix.md).
 
+> **Historical**: the verification guides and the compatibility matrices under
+> [`results/`](results) were produced against the 2025-era protocol, before this repository
+> moved to `2026-07-28`. Their `resources/subscribe` / `resources/unsubscribe` steps no
+> longer apply to the server described above — the flow is now the one in
+> [Expected Client Behavior](#expected-client-behavior). They are kept as a record of the
+> compatibility spike, not as instructions to follow.
+
 ## Skill Templates
 
-Reusable Codex skill templates are tracked under [`docs/skills`](docs/skills). The `pr-review-subscribe` template documents a PR review cycle that uses MCP `resources/subscribe` as the primary wait route and polling only as fallback.
+Reusable Codex skill templates are tracked under [`docs/skills`](docs/skills). The `pr-review-subscribe` template documents a PR review cycle that uses an MCP resource subscription as the primary wait route and polling only as fallback. It predates the `2026-07-28` migration and still describes the 2025-era `resources/subscribe` wire calls; the wait strategy carries over, the RPC names do not.
 
 ## Client Compatibility
 

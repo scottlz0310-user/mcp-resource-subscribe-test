@@ -48,6 +48,12 @@ export class ReviewStatusStore {
     return this.state;
   }
 
+  /** 次の購読サイクルのために初期状態へ戻す。同一プロセスへ何度でも probe を当てられるようにする。 */
+  reset(): ReviewStatusState {
+    this.state = createInitialReviewStatus(this.config);
+    return this.state;
+  }
+
   markUpdated(): ReviewStatusState {
     this.state = createUpdatedReviewStatus(this.config);
     return this.state;

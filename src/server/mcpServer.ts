@@ -15,12 +15,7 @@ export interface ProbeServerDeps {
   /** リクエスト間で共有される状態。McpServer は 2026-07-28 ではリクエストごとに作り直されるため、ここに置けない。 */
   store: ReviewStatusStore;
   log?: LogSink;
-  /**
-   * resources/read を受けたときに呼ばれる。更新シミュレーションの起点。
-   * 2026-07-28 には resources/subscribe RPC が無く、subscriptions/listen が
-   * 開いたことを server 実装から観測する手段も無いため、「クライアントが
-   * resource を見に来た」ことを購読開始の代理シグナルとして使う。
-   */
+  /** resources/read を受けたときに呼ばれる。購読サイクル境界の判定に使う。 */
   onResourceRead?: (uri: string) => void;
 }
 
@@ -94,9 +89,10 @@ export function createProbeServer(deps: ProbeServerDeps): McpServer {
     const uri = request.params.uri;
     assertReviewStatusUri(uri);
 
+    // 状態を読む前に通知する。購読サイクル先頭での初期状態リセットをこの応答へ反映させるため。
+    deps.onResourceRead?.(uri);
     const state = store.get();
     log(`[resources/read] uri=${uri} version=${state.version}`);
-    deps.onResourceRead?.(uri);
 
     return {
       contents: [

@@ -20,7 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - line-based: `subscribed` / `unsubscribed` 行を削除し、`listen-acknowledged` / `honored-uris` / `close-reason` 行を追加
   - `route` / `errorCode` / `notificationReceived` / `finalText` は互換のまま（`squirrel-notifier` はこの 4 つのみを解釈する）
 - **BREAKING**: `call` モードで不明な tool 名・不正な引数は、tool 実行失敗（exit code `1` / `TOOL_ERROR`）ではなく tools/call 自体の拒否として扱い、exit code `3` / `TOOL_REQUEST_REJECTED` を返すようになった。`2026-07-28` では server が tool 実行前に `-32602` で拒否するため
-- リファレンスサーバーの更新シミュレーションの起点を `resources/subscribe` の受信から最初の `resources/read` に変更（新 protocol には subscribe RPC が無く、listen の確立を server 側から観測できないため）
+- リファレンスサーバーの更新シミュレーションの起点を `resources/subscribe` の受信から `subscriptions/listen` の stream 開通に変更（新 protocol には subscribe RPC が無いため、`createMcpHandler` へ渡す `ServerEventBus` の listener 登録を購読開始のシグナルとして使う）。read を起点にすると通知の発行時点で stream が開いておらず通知が失われうる
+- リファレンスサーバーが購読サイクルごとに resource の状態を version 1 へ戻すようになった（listen stream が 1 本も無い状態での `resources/read` をサイクル境界とする）。stateless 化で `store` がアプリスコープになったため、同じサーバープロセスに対する 2 回目以降の probe が更新を観測できなくなっていた
+- probe クライアントの `resources/read` / `resources/list` を `cacheMode: "bypass"` に固定（SDK v2 は SEP-2549 の cache hint を尊重するため、`ttlMs > 0` を返すサーバーに対して古い内容を現在値として報告しうる）
 
 ### Added
 
@@ -30,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- listen stream が「通知待機の合間」に切断された場合、待機側に waiter が居らず切断を取りこぼし、次の待機が `SUBSCRIPTION_DISCONNECTED` ではなく `NOTIFICATION_TIMEOUT` を返していたのを修正（切断状態を保持し、以降の待機を即座に落とす）
+- SIGTERM / SIGINT 受信時、`closeAllConnections()` が MCP handler の `close()` 完了後にしか実行されず、開いている `subscriptions/listen` stream があるとサーバーが終了できなかったのを修正
 - `classifyNetworkError` が `SdkError` の `data.cause` を辿らず、version negotiation 中に発生した DNS 解決失敗・接続拒否・TLS 不信頼を分類できなかったのを修正
 - リファレンスサーバーの Docker runtime stage が `pnpm install --prod` で devDependencies を除外していたため、devDependencies にしか存在しない依存（`express` ほか）を読み込めず起動できなかったのを修正
 

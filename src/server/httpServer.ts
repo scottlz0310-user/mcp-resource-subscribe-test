@@ -1,5 +1,10 @@
 import { toNodeHandler } from "@modelcontextprotocol/node";
-import { createMcpHandler } from "@modelcontextprotocol/server";
+import {
+  createMcpHandler,
+  InMemoryServerEventBus,
+  type ServerEvent,
+  type ServerEventBus,
+} from "@modelcontextprotocol/server";
 import express, { type Request, type Response } from "express";
 import type { TestConfig } from "./config.js";
 import type { LogSink } from "./logger.js";
@@ -18,17 +23,64 @@ export function createMcpHttpApp(config: TestConfig, log: LogSink = () => undefi
   // 更新シミュレーションは handler の外（アプリのスコープ）に置く。
   const store = new ReviewStatusStore(config);
   let updateTimer: NodeJS.Timeout | undefined;
+  let openListenStreams = 0;
 
-  const handler = createMcpHandler(() => createProbeServer({ config, store, log, onResourceRead: scheduleUpdate }), {
+  const innerBus = new InMemoryServerEventBus((error) => log(`[server/error] ${error.message}`));
+  // subscriptions/listen が開いた stream ごとに bus へ listener が登録される。
+  // 2026-07-28 に resources/subscribe RPC は無いため、この登録が「クライアントが
+  // 通知を待ち始めた」ことを server 側から観測できる唯一の点になる。
+  const bus: ServerEventBus = {
+    publish: (event: ServerEvent) => innerBus.publish(event),
+    subscribe: (listener: (event: ServerEvent) => void) => {
+      const unsubscribe = innerBus.subscribe(listener);
+      let released = false;
+
+      if (++openListenStreams === 1) {
+        scheduleUpdate();
+      }
+
+      return () => {
+        if (!released) {
+          released = true;
+          if (--openListenStreams === 0) {
+            clearUpdateTimer();
+          }
+        }
+        unsubscribe();
+      };
+    },
+  };
+
+  const handler = createMcpHandler(() => createProbeServer({ config, store, log, onResourceRead: startCycle }), {
     legacy: "reject",
+    bus,
     onerror: (error) => log(`[server/error] ${error.message}`),
   });
 
-  function scheduleUpdate(): void {
-    if (updateTimer || store.get().version >= 2) {
-      return;
+  function clearUpdateTimer(): void {
+    if (updateTimer) {
+      clearTimeout(updateTimer);
+      updateTimer = undefined;
     }
+  }
 
+  /**
+   * listen stream が 1 本も開いていない状態の read = 新しい購読サイクルの initial read。
+   * ここで初期状態へ戻さないと、前サイクルで version 2 になった store がそのまま残り、
+   * 同じサーバープロセスに対する 2 回目以降の probe が更新を観測できなくなる。
+   */
+  function startCycle(): void {
+    if (openListenStreams === 0) {
+      store.reset();
+    }
+  }
+
+  function scheduleUpdate(): void {
+    clearUpdateTimer();
+
+    // 起点は stream の開通。read を起点にすると、通知の発行時点でまだ stream が
+    // 開いておらず通知が失われうる（InMemoryServerEventBus はバッファせず、その
+    // 時点の listener にのみ同期配信する）。
     updateTimer = setTimeout(() => {
       updateTimer = undefined;
       const state = store.markUpdated();
@@ -67,10 +119,7 @@ export function createMcpHttpApp(config: TestConfig, log: LogSink = () => undefi
   return {
     app,
     close: async () => {
-      if (updateTimer) {
-        clearTimeout(updateTimer);
-        updateTimer = undefined;
-      }
+      clearUpdateTimer();
       await handler.close();
     },
   };

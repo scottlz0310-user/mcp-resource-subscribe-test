@@ -11,14 +11,13 @@ const httpServer = app.listen(config.port, "0.0.0.0", () => {
 });
 
 const shutdown = () => {
+  httpServer.close();
+  // subscriptions/listen の SSE ストリームなど生存中の接続が残っていると close() も
+  // httpServer.close() も完了しない（シグナルハンドラ登録済みのため 2 度目の SIGINT でも
+  // 終了できない）。テストサーバーに graceful drain は不要なので、待つ前に全接続を切断する。
+  httpServer.closeAllConnections();
   void close().finally(() => {
-    httpServer.close(() => {
-      process.exit(0);
-    });
-    // subscriptions/listen の SSE ストリームなど生存中の接続が残っていると close() は
-    // 完了しない（シグナルハンドラ登録済みのため 2 度目の SIGINT でも終了できない）。
-    // テストサーバーに graceful drain は不要なので即座に全接続を切断する。
-    httpServer.closeAllConnections();
+    process.exit(0);
   });
 };
 

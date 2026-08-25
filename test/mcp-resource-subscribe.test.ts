@@ -255,14 +255,14 @@ describe("MCP resource subscription probe", () => {
       notified.push(notification.params.uri);
     });
 
-    const subscription = await client.listen({ resourceSubscriptions: [REVIEW_STATUS_URI] });
-    expect(subscription.honoredFilter.resourceSubscriptions).toContain(REVIEW_STATUS_URI);
-
-    // 更新シミュレーションは resources/read を起点にする（2026-07-28 に
-    // resources/subscribe RPC は無く、listen の確立を server 側から観測できない）。
     const initial = await client.readResource({ uri: REVIEW_STATUS_URI });
     expect(getText(initial)).toContain("version: 1");
     expect(getText(initial)).toContain("status: pending");
+
+    // 更新シミュレーションは subscriptions/listen の stream 開通を起点にする
+    // （2026-07-28 に resources/subscribe RPC は無い）。read だけでは更新は始まらない。
+    const subscription = await client.listen({ resourceSubscriptions: [REVIEW_STATUS_URI] });
+    expect(subscription.honoredFilter.resourceSubscriptions).toContain(REVIEW_STATUS_URI);
 
     await expect.poll(() => notified, { timeout: 2_000 }).toContain(REVIEW_STATUS_URI);
 
@@ -315,6 +315,20 @@ describe("MCP resource subscription probe", () => {
         "[resources/read] uri=test://review/status version=2",
       ]),
     );
+  });
+
+  it("serves repeated probes against the same server process", async () => {
+    const logs: string[] = [];
+    const url = await startServer(logs);
+
+    for (const attempt of [1, 2, 3]) {
+      const result = await runSubscribeProbe({ url: url.toString(), timeoutMs: 2_000 });
+
+      expect(result.errorCode, `probe ${attempt}`).toBeNull();
+      expect(result.route, `probe ${attempt}`).toBe("subscription");
+      expect(result.initialText, `probe ${attempt}`).toContain("version: 1");
+      expect(result.finalText, `probe ${attempt}`).toContain("version: 2");
+    }
   });
 
   it("keeps the subscription open while recommended_next_action is POLL_AFTER", async () => {

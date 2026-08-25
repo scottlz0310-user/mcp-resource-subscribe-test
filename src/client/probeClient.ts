@@ -55,6 +55,15 @@ export interface SubscribeProbeResult {
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const RESOURCE_UPDATED_METHOD = "notifications/resources/updated";
+/**
+ * SDK v2 は SEP-2549 の cache hint を尊重し、既定の `cacheMode: "use"` では
+ * まだ fresh な同一 URI のキャッシュをラウンドトリップ無しで返す。キャッシュの
+ * eviction 契機は `notifications/resources/updated` の受信なので、通知が来ない
+ * 経路（pre-completion 判定の読み直し）では効かず、サーバーが `ttlMs > 0` を
+ * 返すと probe が古い内容を現在値として報告してしまう。probe は常に実サーバーの
+ * 現在値を観測するのが契約なので、cacheable verb は明示的に bypass する。
+ */
+const UNCACHED: { cacheMode: "bypass" } = { cacheMode: "bypass" };
 const NON_TERMINAL_RECOMMENDED_ACTIONS = new Set(["POLL_AFTER"]);
 
 /** Thrown into a pending notification wait when the listen stream ends first. */
@@ -83,7 +92,11 @@ interface ResourceUpdateQueue {
   readonly receivedCount: number;
   readonly lastUri: string;
   readonly waitAfter: (sequence: number, timeoutMs: number) => Promise<ResourceUpdateEvent>;
-  /** Rejects any pending wait — used when the listen stream ends before an update arrives. */
+  /**
+   * Marks the stream as dead — used when the listen stream ends before an
+   * update arrives. Rejects the pending wait and every later one, so a close
+   * that lands between two waits is still reported as a disconnect.
+   */
   readonly fail: (error: Error) => void;
   readonly cancel: () => void;
 }
@@ -92,6 +105,7 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
   const events: ResourceUpdateEvent[] = [];
   let receivedCount = 0;
   let lastUri = "";
+  let failure: Error | null = null;
   let pending: {
     afterSequence: number;
     resolve: (event: ResourceUpdateEvent) => void;
@@ -137,6 +151,13 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
         return Promise.resolve(existing);
       }
 
+      // 待機の合間に stream が閉じた場合、この時点で pending は存在しないため
+      // fail() は誰も落とせない。閉じた事実をここで持ち回り、以降の待機を
+      // 新しいタイマーで待たせずに切断として即座に落とす。
+      if (failure) {
+        return Promise.reject(failure);
+      }
+
       if (timeoutMs <= 0) {
         return Promise.reject(new Error("Timed out waiting for resource update notification"));
       }
@@ -158,6 +179,7 @@ function createResourceUpdateQueue(client: Client, uri: string): ResourceUpdateQ
       });
     },
     fail: (error: Error) => {
+      failure ??= error;
       if (pending) {
         const waiter = pending;
         pending = null;
@@ -255,7 +277,7 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
     if (options.skipResourceListCheck) {
       resourceFound = true;
     } else {
-      const resources = await client.listResources();
+      const resources = await client.listResources(undefined, UNCACHED);
       resourceFound = resources.resources.some((resource) => resource.uri === uri);
       if (!resourceFound) {
         return {
@@ -274,7 +296,7 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
       }
     }
 
-    const initial = await client.readResource({ uri });
+    const initial = await client.readResource({ uri }, UNCACHED);
     const initialText = getResourceText(initial);
     const notifications = createResourceUpdateQueue(client, uri);
     let notificationUri = "";
@@ -346,7 +368,7 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
       // pre-completion race condition: if the resource was already updated
       // before our subscription was acknowledged, we will never receive that
       // notification. Comparing with initialText detects this window.
-      const postListenText = getResourceText(await client.readResource({ uri }));
+      const postListenText = getResourceText(await client.readResource({ uri }, UNCACHED));
       notificationSequence = postListenReadAfterSequence;
       if (postListenText !== initialText) {
         finalText = postListenText;
@@ -368,7 +390,7 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
             break;
           }
 
-          finalText = getResourceText(await client.readResource({ uri }));
+          finalText = getResourceText(await client.readResource({ uri }, UNCACHED));
         }
       } else {
         try {
@@ -381,7 +403,7 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
         }
 
         if (route === "subscription") {
-          finalText = getResourceText(await client.readResource({ uri }));
+          finalText = getResourceText(await client.readResource({ uri }, UNCACHED));
           while (shouldWaitForNextUpdate(finalText) && !errorCode) {
             try {
               const event = await notifications.waitAfter(notificationSequence, remainingMs());
@@ -392,7 +414,7 @@ export async function runSubscribeProbe(options: SubscribeProbeOptions): Promise
               break;
             }
 
-            finalText = getResourceText(await client.readResource({ uri }));
+            finalText = getResourceText(await client.readResource({ uri }, UNCACHED));
           }
         }
       }
