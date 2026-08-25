@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `vitest` が `dist/test/*.test.js` も収集し、`pnpm run build` 後に `pnpm test` を実行するとコンパイル済みの古いテストが二重実行されていたのを修正。vitest 4 の `defaultExclude` から `dist` が外れたのが原因で、`vitest.config.ts` の `test.exclude` に `dist/**` を明示した（CI は build 前に test するため公開物への影響はなし）
+
 ## [0.6.0] - 2026-08-25
 
 ### Added
