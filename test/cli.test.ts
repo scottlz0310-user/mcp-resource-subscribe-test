@@ -40,7 +40,7 @@ async function runCli(args: string[]): Promise<ExecResult> {
 }
 
 async function startTestServer(updateDelaySeconds = 0.05): Promise<{ url: string; close: () => Promise<void> }> {
-  const app = createMcpHttpApp(
+  const { app, close: closeHandler } = createMcpHttpApp(
     {
       port: 0,
       mcpPath: "/mcp",
@@ -56,8 +56,10 @@ async function startTestServer(updateDelaySeconds = 0.05): Promise<{ url: string
   await once(server, "listening");
   const { port } = server.address() as AddressInfo;
   const url = `http://127.0.0.1:${port}/mcp`;
-  const close = (): Promise<void> =>
-    new Promise((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  const close = async (): Promise<void> => {
+    await closeHandler();
+    await new Promise<void>((resolve, reject) => server.close((err) => (err ? reject(err) : resolve())));
+  };
   return { url, close };
 }
 
@@ -83,7 +85,7 @@ describe("--json CLI process output", () => {
     expect(json.errorCode).toBe("SERVER_URL_UNKNOWN");
     expect(json.serverUrl).toBeNull();
     expect(json.resourceUri).toBe("queue://review/queue");
-    expect(json.subscribed).toBe(false);
+    expect(json.listenAcknowledged).toBe(false);
   });
 
   it("SERVER_URL_UNKNOWN: line-based output (no --json) does not emit JSON", async () => {
@@ -103,7 +105,7 @@ describe("--json CLI process output", () => {
       const json = JSON.parse(result.stdout) as JsonOutput;
       expect(json.route).toBe("subscription");
       expect(json.serverUrl).toBe(url);
-      expect(json.subscribed).toBe(true);
+      expect(json.listenAcknowledged).toBe(true);
       expect(json.notificationReceived).toBe(true);
       expect(json.errorCode).toBeNull();
     } finally {
@@ -164,7 +166,7 @@ describe("--json CLI process output", () => {
     expect(result.exitCode).toBe(1);
     const json = JSON.parse(result.stdout) as JsonOutput;
     expect(json.errorCode).toBe("INTERNAL_ERROR");
-    expect(json.subscribed).toBe(false);
+    expect(json.listenAcknowledged).toBe(false);
     // stdout must not contain a stack trace
     expect(result.stdout).not.toContain("at ");
   });

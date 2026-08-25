@@ -1,25 +1,17 @@
-import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import type { Server } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import {
-  ErrorCode,
-  isInitializeRequest,
-  ListResourcesRequestSchema,
-  McpError,
-  ReadResourceRequestSchema,
-  ResourceUpdatedNotificationSchema,
-  SubscribeRequestSchema,
-  UnsubscribeRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import express from "express";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import { createMcpHandler, type McpHttpHandler, McpServer } from "@modelcontextprotocol/server";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildJsonOutput, type JsonOutput } from "../src/client/jsonOutput.js";
 import { extractRecommendedAction, runSubscribeProbe } from "../src/client/probeClient.js";
+import {
+  PINNED_CLIENT_OPTIONS,
+  PINNED_PROTOCOL_VERSION,
+  ProtocolNegotiationError,
+} from "../src/client/protocolNegotiation.js";
 import { configFromEnv, type TestConfig } from "../src/server/config.js";
 import { createMcpHttpApp } from "../src/server/httpServer.js";
 import {
@@ -42,17 +34,52 @@ const TEST_CONFIG: TestConfig = {
 
 const servers: Server[] = [];
 const clients: Client[] = [];
+const closers: Array<() => Promise<void>> = [];
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function startServer(logs: string[]) {
-  const app = createMcpHttpApp(TEST_CONFIG, (line) => logs.push(line));
-  const server = app.listen(0, "127.0.0.1");
+async function listenOn(server: Server): Promise<string> {
   servers.push(server);
+  server.listen(0, "127.0.0.1");
   await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  return `http://127.0.0.1:${port}/mcp`;
+}
 
-  const address = server.address() as AddressInfo;
-  return new URL(`http://127.0.0.1:${address.port}/mcp`);
+async function startServer(logs: string[], config: TestConfig = TEST_CONFIG): Promise<URL> {
+  const { app, close } = createMcpHttpApp(config, (line) => logs.push(line));
+  closers.push(close);
+  return new URL(await listenOn(createServer(app)));
+}
+
+interface StartedHandler {
+  url: string;
+  handler: McpHttpHandler;
+  server: Server;
+}
+
+/**
+ * Starts a bare 2026-07-28 handler over node:http. Every ad-hoc server in this
+ * file goes through here so they exercise the same modern-only serving the
+ * reference server uses.
+ */
+async function startHandler(
+  factory: () => McpServer,
+  options: { maxSubscriptions?: number } = {},
+): Promise<StartedHandler> {
+  const handler = createMcpHandler(factory, { legacy: "reject", ...options });
+  closers.push(() => handler.close());
+  const nodeHandler = toNodeHandler(handler);
+  const server = createServer((req, res) => {
+    void nodeHandler(req, res);
+  });
+  return { url: await listenOn(server), handler, server };
+}
+
+function connectClient(url: string | URL, name = "test-client"): Promise<Client> {
+  const client = new Client({ name, version: "0.1.0" }, PINNED_CLIENT_OPTIONS);
+  clients.push(client);
+  return client.connect(new StreamableHTTPClientTransport(new URL(url))).then(() => client);
 }
 
 function getText(result: Awaited<ReturnType<Client["readResource"]>>): string {
@@ -64,25 +91,14 @@ function getText(result: Awaited<ReturnType<Client["readResource"]>>): string {
   return first.text;
 }
 
-function waitForUpdatedNotification(client: Client): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      reject(new Error("Timed out waiting for resource update notification"));
-    }, 2_000);
-
-    client.setNotificationHandler(ResourceUpdatedNotificationSchema, (notification) => {
-      clearTimeout(timeout);
-      resolve(notification.params.uri);
-    });
-  });
-}
-
 afterEach(async () => {
   await Promise.allSettled(clients.splice(0).map((client) => client.close()));
+  await Promise.allSettled(closers.splice(0).map((close) => close()));
   await Promise.allSettled(
     servers.splice(0).map(
       (server) =>
         new Promise<void>((resolve, reject) => {
+          server.closeAllConnections();
           server.close((error) => {
             if (error) {
               reject(error);
@@ -95,77 +111,6 @@ afterEach(async () => {
   );
 });
 
-async function startSubscribeRejectingServer(): Promise<string> {
-  const app = express();
-  const transports = new Map<string, StreamableHTTPServerTransport>();
-
-  app.use(express.json({ limit: "1mb", type: ["application/json", "application/*+json"] }));
-
-  app.post("/mcp", async (req, res) => {
-    const sessionId = req.header("mcp-session-id") ?? undefined;
-    try {
-      let transport: StreamableHTTPServerTransport | undefined;
-
-      if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
-          res.status(404).json({ jsonrpc: "2.0", error: { code: -32000, message: "Unknown session" }, id: null });
-          return;
-        }
-      } else if (isInitializeRequest(req.body)) {
-        const mcpServer = new McpServer(
-          { name: "test-no-subscribe", version: "0.1.0" },
-          { capabilities: { resources: { subscribe: true } } },
-        );
-
-        mcpServer.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-          resources: [REVIEW_STATUS_RESOURCE],
-        }));
-
-        mcpServer.server.setRequestHandler(ReadResourceRequestSchema, async () => ({
-          contents: [
-            {
-              uri: REVIEW_STATUS_URI,
-              mimeType: "text/plain",
-              text: renderReviewStatus(createInitialReviewStatus(TEST_CONFIG)),
-            },
-          ],
-        }));
-
-        mcpServer.server.setRequestHandler(SubscribeRequestSchema, async () => {
-          throw new McpError(ErrorCode.MethodNotFound, "Subscriptions not supported by this server");
-        });
-
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id) => {
-            if (transport) transports.set(id, transport);
-          },
-          onsessionclosed: (id) => {
-            transports.delete(id);
-          },
-        });
-        await mcpServer.connect(transport);
-      } else {
-        res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request" }, id: null });
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
-    } catch {
-      if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
-      }
-    }
-  });
-
-  const server = app.listen(0, "127.0.0.1");
-  servers.push(server);
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  return `http://127.0.0.1:${address.port}/mcp`;
-}
-
 interface ActionSequenceReadContext {
   readCount: number;
   textIndex: number;
@@ -175,129 +120,76 @@ interface ActionSequenceReadContext {
 
 interface ActionSequenceServerOptions {
   readText?: (context: ActionSequenceReadContext) => string | Promise<string>;
+  /** Advertised resources.subscribe capability. false makes the ack drop our URI. */
+  subscribeCapability?: boolean;
+  maxSubscriptions?: number;
 }
 
+/**
+ * A server that walks `texts` as the resource body, publishing an update after
+ * each entry of `updateDelaysMs`. The timers start on the second read — the
+ * probe's post-listen read — so an update can never fire before the
+ * subscription has been acknowledged.
+ */
 async function startActionSequenceServer(
   texts: string[],
   updateDelaysMs: number[],
   options: ActionSequenceServerOptions = {},
 ): Promise<string> {
-  const app = express();
-  const transports = new Map<string, StreamableHTTPServerTransport>();
+  let readCount = 0;
+  let textIndex = 0;
+  let timersStarted = false;
+  let started: StartedHandler | undefined;
 
-  app.use(express.json({ limit: "1mb", type: ["application/json", "application/*+json"] }));
+  const setTextIndex = (index: number): void => {
+    textIndex = index;
+  };
+  const sendUpdate = async (): Promise<void> => {
+    started?.handler.notify.resourceUpdated(REVIEW_STATUS_URI);
+  };
+  const startTimers = (): void => {
+    if (timersStarted) {
+      return;
+    }
+    timersStarted = true;
+    for (const [index, delayMs] of updateDelaysMs.entries()) {
+      setTimeout(() => {
+        setTextIndex(index + 1);
+        void sendUpdate();
+      }, delayMs).unref();
+    }
+  };
 
-  app.post("/mcp", async (req, res) => {
-    const sessionId = req.header("mcp-session-id") ?? undefined;
-    try {
-      let transport: StreamableHTTPServerTransport | undefined;
+  started = await startHandler(
+    () => {
+      const server = new McpServer(
+        { name: "test-action-sequence", version: "0.1.0" },
+        { capabilities: { resources: { subscribe: options.subscribeCapability ?? true } } },
+      );
 
-      if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
-          res.status(404).json({ jsonrpc: "2.0", error: { code: -32000, message: "Unknown session" }, id: null });
-          return;
+      server.server.setRequestHandler("resources/list", async () => ({
+        resources: [REVIEW_STATUS_RESOURCE],
+      }));
+
+      server.server.setRequestHandler("resources/read", async () => {
+        readCount++;
+        const text = options.readText
+          ? await options.readText({ readCount, textIndex, setTextIndex, sendUpdate })
+          : (texts[textIndex] ?? "");
+        if (readCount >= 2) {
+          startTimers();
         }
-      } else if (isInitializeRequest(req.body)) {
-        const mcpServer = new McpServer(
-          { name: "test-action-sequence", version: "0.1.0" },
-          { capabilities: { resources: { subscribe: true } } },
-        );
-
-        let readCount = 0;
-        let textIndex = 0;
-        const subscriptions = new Set<string>();
-        const setTextIndex = (index: number) => {
-          textIndex = index;
+        return {
+          contents: [{ uri: REVIEW_STATUS_URI, mimeType: "text/plain", text }],
         };
-        const sendUpdate = async () => {
-          if (subscriptions.has(REVIEW_STATUS_URI)) {
-            await mcpServer.server.sendResourceUpdated({ uri: REVIEW_STATUS_URI });
-          }
-        };
-        mcpServer.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-          resources: [REVIEW_STATUS_RESOURCE],
-        }));
+      });
 
-        mcpServer.server.setRequestHandler(ReadResourceRequestSchema, async () => {
-          readCount++;
-          const text = options.readText
-            ? await options.readText({ readCount, textIndex, setTextIndex, sendUpdate })
-            : (texts[textIndex] ?? "");
-          return {
-            contents: [{ uri: REVIEW_STATUS_URI, mimeType: "text/plain", text }],
-          };
-        });
+      return server;
+    },
+    options.maxSubscriptions === undefined ? {} : { maxSubscriptions: options.maxSubscriptions },
+  );
 
-        mcpServer.server.setRequestHandler(SubscribeRequestSchema, async () => {
-          subscriptions.add(REVIEW_STATUS_URI);
-          updateDelaysMs.forEach((delayMs, index) => {
-            setTimeout(() => {
-              void (async () => {
-                setTextIndex(index + 1);
-                await sendUpdate();
-              })().catch(() => undefined);
-            }, delayMs);
-          });
-          return {};
-        });
-
-        mcpServer.server.setRequestHandler(UnsubscribeRequestSchema, async () => {
-          subscriptions.delete(REVIEW_STATUS_URI);
-          return {};
-        });
-
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (id) => {
-            if (transport) transports.set(id, transport);
-          },
-          onsessionclosed: (id) => {
-            transports.delete(id);
-          },
-        });
-        await mcpServer.connect(transport);
-      } else {
-        res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request" }, id: null });
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
-    } catch {
-      if (!res.headersSent) {
-        res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
-      }
-    }
-  });
-
-  app.get("/mcp", async (req, res) => {
-    const sessionId = req.header("mcp-session-id") ?? undefined;
-    const transport = sessionId ? transports.get(sessionId) : undefined;
-    if (!sessionId || !transport) {
-      res.status(400).send("Invalid or missing session ID");
-      return;
-    }
-
-    await transport.handleRequest(req, res);
-  });
-
-  app.delete("/mcp", async (req, res) => {
-    const sessionId = req.header("mcp-session-id") ?? undefined;
-    const transport = sessionId ? transports.get(sessionId) : undefined;
-    if (!sessionId || !transport) {
-      res.status(400).send("Invalid or missing session ID");
-      return;
-    }
-
-    await transport.handleRequest(req, res);
-    transports.delete(sessionId);
-  });
-
-  const server = app.listen(0, "127.0.0.1");
-  servers.push(server);
-  await once(server, "listening");
-  const address = server.address() as AddressInfo;
-  return `http://127.0.0.1:${address.port}/mcp`;
+  return started.url;
 }
 
 describe("MCP resource subscription probe", () => {
@@ -321,11 +213,7 @@ describe("MCP resource subscription probe", () => {
   it("exposes get_review_status in tools/list and returns status text on tools/call", async () => {
     const logs: string[] = [];
     const url = await startServer(logs);
-    const client = new Client({ name: "test-tool-client", version: "0.1.0" });
-    clients.push(client);
-
-    const transport = new StreamableHTTPClientTransport(url);
-    await client.connect(transport);
+    const client = await connectClient(url, "test-tool-client");
 
     const { tools } = await client.listTools();
     expect(tools).toContainEqual(expect.objectContaining({ name: "get_review_status" }));
@@ -343,21 +231,14 @@ describe("MCP resource subscription probe", () => {
     expect(logs).toContain("[tools/call] get_review_status");
   });
 
-  it("lists, reads, subscribes, notifies, and re-reads the updated resource", async () => {
+  it("lists, reads, listens, acknowledges, notifies, and re-reads the updated resource", async () => {
     const logs: string[] = [];
     const url = await startServer(logs);
-    const client = new Client({
-      name: "mcp-resource-subscribe-test-client",
-      version: "0.1.0",
-    });
-    clients.push(client);
-
-    const transport = new StreamableHTTPClientTransport(url);
-    await client.connect(transport);
+    const client = await connectClient(url, "mcp-resource-subscribe-test-client");
 
     expect(client.getServerCapabilities()?.resources).toEqual({
       subscribe: true,
-      listChanged: true,
+      listChanged: false,
     });
 
     const resources = await client.listResources();
@@ -369,31 +250,35 @@ describe("MCP resource subscription probe", () => {
       }),
     );
 
+    const notified: string[] = [];
+    client.setNotificationHandler("notifications/resources/updated", (notification) => {
+      notified.push(notification.params.uri);
+    });
+
+    const subscription = await client.listen({ resourceSubscriptions: [REVIEW_STATUS_URI] });
+    expect(subscription.honoredFilter.resourceSubscriptions).toContain(REVIEW_STATUS_URI);
+
+    // 更新シミュレーションは resources/read を起点にする（2026-07-28 に
+    // resources/subscribe RPC は無く、listen の確立を server 側から観測できない）。
     const initial = await client.readResource({ uri: REVIEW_STATUS_URI });
     expect(getText(initial)).toContain("version: 1");
     expect(getText(initial)).toContain("status: pending");
 
-    const notification = waitForUpdatedNotification(client);
-    await client.subscribeResource({ uri: REVIEW_STATUS_URI });
-
-    await expect(notification).resolves.toBe(REVIEW_STATUS_URI);
+    await expect.poll(() => notified, { timeout: 2_000 }).toContain(REVIEW_STATUS_URI);
 
     const updated = await client.readResource({ uri: REVIEW_STATUS_URI });
     expect(getText(updated)).toContain("version: 2");
     expect(getText(updated)).toContain("status: reviewed");
 
-    await client.unsubscribeResource({ uri: REVIEW_STATUS_URI });
+    await subscription.close();
 
     expect(logs).toEqual(
       expect.arrayContaining([
-        "[initialize] client connected",
         "[resources/list] requested",
         "[resources/read] uri=test://review/status version=1",
-        "[resources/subscribe] uri=test://review/status",
         "[resource/update] uri=test://review/status version=2",
         "[notification/send] notifications/resources/updated uri=test://review/status",
         "[resources/read] uri=test://review/status version=2",
-        "[resources/unsubscribe] uri=test://review/status",
       ]),
     );
   });
@@ -409,7 +294,7 @@ describe("MCP resource subscription probe", () => {
 
     expect(result.capabilities).toEqual({
       subscribe: true,
-      listChanged: true,
+      listChanged: false,
     });
     expect(result.resourceFound).toBe(true);
     expect(result.initialText).toContain("version: 1");
@@ -419,16 +304,15 @@ describe("MCP resource subscription probe", () => {
     expect(result.finalText).toContain("version: 2");
     expect(result.finalText).toContain("status: reviewed");
     expect(result.route).toBe("subscription");
-    expect(result.subscribed).toBe(true);
-    expect(result.unsubscribed).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
+    expect(result.honoredUris).toEqual([REVIEW_STATUS_URI]);
+    expect(result.closeReason).toBe("local");
     expect(result.errorCode).toBeNull();
 
     expect(logs).toEqual(
       expect.arrayContaining([
-        "[resources/subscribe] uri=test://review/status",
         "[notification/send] notifications/resources/updated uri=test://review/status",
         "[resources/read] uri=test://review/status version=2",
-        "[resources/unsubscribe] uri=test://review/status",
       ]),
     );
   });
@@ -450,13 +334,13 @@ describe("MCP resource subscription probe", () => {
     });
 
     expect(result.resourceFound).toBe(true);
-    expect(result.subscribed).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
     expect(result.route).toBe("subscription");
     expect(result.notificationUri).toBe(REVIEW_STATUS_URI);
     expect(result.notificationCount).toBe(2);
     expect(result.finalText).toContain("review_status: COMPLETED");
     expect(result.finalText).toContain("recommended_next_action: READ_REVIEW_THREADS");
-    expect(result.unsubscribed).toBe(true);
+    expect(result.closeReason).toBe("local");
     expect(result.errorCode).toBeNull();
   });
 
@@ -474,7 +358,7 @@ describe("MCP resource subscription probe", () => {
               setTextIndex(2);
               await sendUpdate();
             })().catch(() => undefined);
-          }, 10);
+          }, 10).unref();
 
           await sleep(30);
           return texts[1] ?? "";
@@ -491,13 +375,12 @@ describe("MCP resource subscription probe", () => {
     });
 
     expect(result.resourceFound).toBe(true);
-    expect(result.subscribed).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
     expect(result.route).toBe("subscription");
     expect(result.notificationUri).toBe(REVIEW_STATUS_URI);
     expect(result.notificationCount).toBe(2);
     expect(result.finalText).toContain("review_status: COMPLETED");
     expect(result.finalText).toContain("recommended_next_action: READ_REVIEW_THREADS");
-    expect(result.unsubscribed).toBe(true);
     expect(result.errorCode).toBeNull();
   });
 
@@ -512,7 +395,7 @@ describe("MCP resource subscription probe", () => {
     });
 
     expect(result.resourceFound).toBe(true);
-    expect(result.subscribed).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
     expect(result.route).toBe("subscription");
     expect(result.errorCode).toBeNull();
     // Verify the resources/list round-trip was skipped
@@ -532,22 +415,17 @@ describe("MCP resource subscription probe", () => {
     expect(result.resourceFound).toBe(false);
     expect(result.errorCode).toBe("RESOURCE_NOT_FOUND");
     expect(result.route).toBe("timeout");
-    expect(result.subscribed).toBe(false);
-    expect(result.unsubscribed).toBe(false);
+    expect(result.listenAcknowledged).toBe(false);
+    expect(result.honoredUris).toEqual([]);
   });
 
   it("returns NOTIFICATION_TIMEOUT errorCode when server never sends notification", async () => {
     const logs: string[] = [];
     // Use a large updateDelaySeconds so the notification never arrives within the probe timeout
-    const app = createMcpHttpApp({ ...TEST_CONFIG, updateDelaySeconds: 100 }, (line) => logs.push(line));
-    const server = app.listen(0, "127.0.0.1");
-    servers.push(server);
-    await once(server, "listening");
-    const address = server.address() as import("node:net").AddressInfo;
-    const url = `http://127.0.0.1:${address.port}/mcp`;
+    const url = await startServer(logs, { ...TEST_CONFIG, updateDelaySeconds: 100 });
 
     const result = await runSubscribeProbe({
-      url,
+      url: url.toString(),
       uri: REVIEW_STATUS_URI,
       timeoutMs: 200,
     });
@@ -555,24 +433,102 @@ describe("MCP resource subscription probe", () => {
     expect(result.resourceFound).toBe(true);
     expect(result.errorCode).toBe("NOTIFICATION_TIMEOUT");
     expect(result.route).toBe("timeout");
-    expect(result.subscribed).toBe(true);
-    expect(result.unsubscribed).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
+    expect(result.closeReason).toBe("local");
   });
 
-  it("returns SUBSCRIPTION_FAILED errorCode when server rejects the subscribe request", async () => {
-    const url = await startSubscribeRejectingServer();
+  it("returns SUBSCRIPTION_NOT_HONORED when the acknowledgement drops the requested URI", async () => {
+    const url = await startActionSequenceServer(["initial-text"], [], { subscribeCapability: false });
 
-    const result = await runSubscribeProbe({
-      url,
-      uri: REVIEW_STATUS_URI,
-      timeoutMs: 2_000,
-    });
+    const result = await runSubscribeProbe({ url, uri: REVIEW_STATUS_URI, timeoutMs: 2_000 });
+
+    expect(result.resourceFound).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
+    expect(result.honoredUris).not.toContain(REVIEW_STATUS_URI);
+    expect(result.errorCode).toBe("SUBSCRIPTION_NOT_HONORED");
+    expect(result.route).toBe("timeout");
+  });
+
+  it("returns SUBSCRIPTION_FAILED errorCode when the server rejects subscriptions/listen", async () => {
+    const url = await startActionSequenceServer(["initial-text"], [], { maxSubscriptions: 0 });
+
+    const result = await runSubscribeProbe({ url, uri: REVIEW_STATUS_URI, timeoutMs: 2_000 });
 
     expect(result.resourceFound).toBe(true);
     expect(result.errorCode).toBe("SUBSCRIPTION_FAILED");
     expect(result.route).toBe("timeout");
-    expect(result.subscribed).toBe(false);
-    expect(result.unsubscribed).toBe(false);
+    expect(result.listenAcknowledged).toBe(false);
+  });
+
+  it("returns SUBSCRIPTION_DISCONNECTED when the listen stream drops without a response", async () => {
+    const logs: string[] = [];
+    const { app, close } = createMcpHttpApp({ ...TEST_CONFIG, updateDelaySeconds: 100 }, (line) => logs.push(line));
+    closers.push(close);
+    const server = createServer(app);
+    const url = await listenOn(server);
+
+    const probe = runSubscribeProbe({ url, uri: REVIEW_STATUS_URI, timeoutMs: 10_000 });
+    // 通知待ちに入ってから接続ごと落とす。listen の応答なしに stream が切れるため、
+    // client からは異常切断として観測されなければならない。
+    await sleep(300);
+    server.closeAllConnections();
+
+    const result = await probe;
+
+    expect(result.listenAcknowledged).toBe(true);
+    expect(result.errorCode).toBe("SUBSCRIPTION_DISCONNECTED");
+    expect(result.closeReason).toBe("remote");
+    expect(result.route).toBe("timeout");
+  });
+
+  describe("2026-07-28 negotiation", () => {
+    it("rejects a pre-2026-07-28 server instead of falling back to resources/subscribe", async () => {
+      // server/discover を知らない旧サーバーの最小再現。
+      const server = createServer((req, res) => {
+        let body = "";
+        req.on("data", (chunk) => {
+          body += String(chunk);
+        });
+        req.on("end", () => {
+          const id = (JSON.parse(body || "{}") as { id?: unknown }).id ?? null;
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id, error: { code: -32601, message: "Method not found" } }));
+        });
+      });
+      const url = await listenOn(server);
+
+      await expect(runSubscribeProbe({ url, uri: REVIEW_STATUS_URI, timeoutMs: 2_000 })).rejects.toBeInstanceOf(
+        ProtocolNegotiationError,
+      );
+    });
+
+    it("rejects a legacy initialize handshake and answers GET with 405", async () => {
+      const logs: string[] = [];
+      const url = await startServer(logs);
+
+      const legacy = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2025-06-18",
+            capabilities: {},
+            clientInfo: { name: "legacy-client", version: "0.0.0" },
+          },
+        }),
+      });
+      const legacyBody = (await legacy.json()) as { error?: { code: number; data?: { supported?: string[] } } };
+      expect(legacyBody.error?.code).toBe(-32022);
+      expect(legacyBody.error?.data?.supported).toContain(PINNED_PROTOCOL_VERSION);
+
+      const get = await fetch(url, { method: "GET" });
+      expect(get.status).toBe(405);
+      // standalone GET SSE は廃止されたため、long-lived stream の抑止ヘッダーだけは残る。
+      expect(get.headers.get("x-accel-buffering")).toBe("no");
+    });
   });
 
   describe("--json output mode (buildJsonOutput)", () => {
@@ -587,10 +543,11 @@ describe("MCP resource subscription probe", () => {
       expect(json.route).toBe("subscription");
       expect(json.serverUrl).toBe(url.toString());
       expect(json.resourceUri).toBe(REVIEW_STATUS_URI);
-      expect(json.subscribed).toBe(true);
+      expect(json.listenAcknowledged).toBe(true);
+      expect(json.honoredUris).toEqual([REVIEW_STATUS_URI]);
       expect(json.notificationReceived).toBe(true);
       expect(json.notificationCount).toBe(1);
-      expect(json.unsubscribed).toBe(true);
+      expect(json.closeReason).toBe("local");
       expect(json.errorCode).toBeNull();
       expect(typeof json.initialText).toBe("string");
       expect(typeof json.finalText).toBe("string");
@@ -606,7 +563,7 @@ describe("MCP resource subscription probe", () => {
       expect(json.route).toBe("timeout");
       expect(json.serverUrl).toBe(url);
       expect(json.resourceUri).toBe(REVIEW_STATUS_URI);
-      expect(json.subscribed).toBe(true);
+      expect(json.listenAcknowledged).toBe(true);
       expect(json.notificationReceived).toBe(false);
       expect(json.notificationCount).toBe(0);
       expect(json.errorCode).toBe("NOTIFICATION_TIMEOUT");
@@ -626,7 +583,7 @@ describe("MCP resource subscription probe", () => {
       const json = JSON.parse(JSON.stringify(output)) as JsonOutput;
 
       expect(json.route).toBe("timeout");
-      expect(json.subscribed).toBe(false);
+      expect(json.listenAcknowledged).toBe(false);
       expect(json.notificationReceived).toBe(false);
       expect(json.errorCode).toBe("RESOURCE_NOT_FOUND");
       expect(json.initialText).toBeNull();
@@ -660,10 +617,11 @@ describe("MCP resource subscription probe", () => {
         "route",
         "serverUrl",
         "resourceUri",
-        "subscribed",
+        "listenAcknowledged",
+        "honoredUris",
         "notificationReceived",
         "notificationCount",
-        "unsubscribed",
+        "closeReason",
         "errorCode",
         "initialText",
         "finalText",
@@ -672,83 +630,36 @@ describe("MCP resource subscription probe", () => {
     });
   });
 
-  it("takes the pre-completion route when resource was already updated before subscription", async () => {
-    // Simulates the race condition: the resource updates between initial read and
-    // subscribe (i.e., the notification fired before our subscription was established).
-    // The server returns version 1 on the first read, accepts subscribe, then returns
-    // version 2 on the post-subscribe read without ever sending a notification.
-    const app = express();
-    const transports = new Map<string, StreamableHTTPServerTransport>();
+  it("takes the pre-completion route when the resource was already updated before the acknowledgement", async () => {
+    // Simulates the race condition: the resource updates between the initial read
+    // and the acknowledgement, so the notification fired before our subscription
+    // existed. The server returns version 1 on the first read and version 2 on
+    // every later read, without ever publishing an update.
+    let readCount = 0;
+    const { url } = await startHandler(() => {
+      const server = new McpServer(
+        { name: "test-pre-completed", version: "0.1.0" },
+        { capabilities: { resources: { subscribe: true } } },
+      );
 
-    app.use(express.json({ limit: "1mb", type: ["application/json", "application/*+json"] }));
+      server.server.setRequestHandler("resources/list", async () => ({
+        resources: [REVIEW_STATUS_RESOURCE],
+      }));
 
-    app.post("/mcp", async (req, res) => {
-      const sessionId = req.header("mcp-session-id") ?? undefined;
-      try {
-        let transport: StreamableHTTPServerTransport | undefined;
+      server.server.setRequestHandler("resources/read", async () => {
+        readCount++;
+        const state = readCount === 1 ? createInitialReviewStatus(TEST_CONFIG) : createUpdatedReviewStatus(TEST_CONFIG);
+        return { contents: [{ uri: REVIEW_STATUS_URI, mimeType: "text/plain", text: renderReviewStatus(state) }] };
+      });
 
-        if (sessionId) {
-          transport = transports.get(sessionId);
-          if (!transport) {
-            res.status(404).json({ jsonrpc: "2.0", error: { code: -32000, message: "Unknown session" }, id: null });
-            return;
-          }
-        } else if (isInitializeRequest(req.body)) {
-          const mcpServer = new McpServer(
-            { name: "test-pre-completed", version: "0.1.0" },
-            { capabilities: { resources: { subscribe: true } } },
-          );
-
-          let readCount = 0;
-          mcpServer.server.setRequestHandler(ListResourcesRequestSchema, async () => ({
-            resources: [REVIEW_STATUS_RESOURCE],
-          }));
-
-          mcpServer.server.setRequestHandler(ReadResourceRequestSchema, async () => {
-            readCount++;
-            // First read (pre-subscribe): initial state. All subsequent reads: updated state.
-            const state =
-              readCount === 1 ? createInitialReviewStatus(TEST_CONFIG) : createUpdatedReviewStatus(TEST_CONFIG);
-            return { contents: [{ uri: REVIEW_STATUS_URI, mimeType: "text/plain", text: renderReviewStatus(state) }] };
-          });
-
-          mcpServer.server.setRequestHandler(SubscribeRequestSchema, async () => ({}));
-          mcpServer.server.setRequestHandler(UnsubscribeRequestSchema, async () => ({}));
-
-          transport = new StreamableHTTPServerTransport({
-            sessionIdGenerator: () => randomUUID(),
-            onsessioninitialized: (id) => {
-              if (transport) transports.set(id, transport);
-            },
-            onsessionclosed: (id) => {
-              transports.delete(id);
-            },
-          });
-          await mcpServer.connect(transport);
-        } else {
-          res.status(400).json({ jsonrpc: "2.0", error: { code: -32000, message: "Bad Request" }, id: null });
-          return;
-        }
-
-        await transport.handleRequest(req, res, req.body);
-      } catch {
-        if (!res.headersSent) {
-          res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: "Internal error" }, id: null });
-        }
-      }
+      return server;
     });
-
-    const server = app.listen(0, "127.0.0.1");
-    servers.push(server);
-    await once(server, "listening");
-    const { port } = server.address() as import("node:net").AddressInfo;
-    const url = `http://127.0.0.1:${port}/mcp`;
 
     const result = await runSubscribeProbe({ url, uri: REVIEW_STATUS_URI, timeoutMs: 500 });
 
     expect(result.resourceFound).toBe(true);
-    expect(result.subscribed).toBe(true);
-    expect(result.unsubscribed).toBe(true);
+    expect(result.listenAcknowledged).toBe(true);
+    expect(result.closeReason).toBe("local");
     expect(result.route).toBe("pre-completion");
     expect(result.initialText).toContain("version: 1");
     expect(result.finalText).toContain("version: 2");

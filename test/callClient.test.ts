@@ -24,7 +24,7 @@ afterEach(async () => {
 });
 
 async function startServer(): Promise<string> {
-  const app = createMcpHttpApp(
+  const { app } = createMcpHttpApp(
     {
       port: 0,
       mcpPath: "/mcp",

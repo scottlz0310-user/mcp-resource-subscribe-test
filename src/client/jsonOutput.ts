@@ -4,10 +4,11 @@ export interface JsonOutput {
   route: string;
   serverUrl: string | null;
   resourceUri: string;
-  subscribed: boolean;
+  listenAcknowledged: boolean;
+  honoredUris: string[];
   notificationReceived: boolean;
   notificationCount: number;
-  unsubscribed: boolean;
+  closeReason: string | null;
   errorCode: string | null;
   initialText: string | null;
   finalText: string | null;
@@ -19,10 +20,11 @@ export function buildJsonOutput(result: SubscribeProbeResult, serverUrl: string,
     route: result.route,
     serverUrl,
     resourceUri,
-    subscribed: result.subscribed,
+    listenAcknowledged: result.listenAcknowledged,
+    honoredUris: result.honoredUris,
     notificationReceived: result.route === "subscription",
     notificationCount: result.notificationCount,
-    unsubscribed: result.unsubscribed,
+    closeReason: result.closeReason,
     errorCode: result.errorCode,
     initialText: result.initialText || null,
     finalText: result.finalText || null,
@@ -40,10 +42,11 @@ export function buildErrorJsonOutput(
     route: "failed",
     serverUrl,
     resourceUri,
-    subscribed: false,
+    listenAcknowledged: false,
+    honoredUris: [],
     notificationReceived: false,
     notificationCount: 0,
-    unsubscribed: false,
+    closeReason: null,
     errorCode,
     initialText: null,
     finalText: null,

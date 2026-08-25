@@ -4,8 +4,8 @@
 
 本リポジトリは、MCP `resources/subscribe` の**互換性検証スパイク**として開始した。CLI AI エージェント（Codex, Gemini, Claude Code, Crush 等）が MCP resource subscription を正しく処理できるかを、再現可能な形でテストするためのものである。この検証フェーズは既に完了しており、現在は以下の 2 つの実運用向けコンポーネントを提供する:
 
-1. **CLI probe**（`mcp-resource-subscriber`、`src/client/cli.ts`）— CLI エージェントのワークフローや外部ツール（例: `squirrel-notifier`）が、MCP resource を subscribe して `notifications/resources/updated` を待ち、結果を構造化された stdout/JSON として報告させるために呼び出す、公開済みのサブプロセス。mcp-gateway 向け認証（`--login` / `--logout`、キャッシュ済みトークンの自動更新）も担い、これらの呼び出し元がトークンを手動で用意する必要をなくす。`call` サブコマンド（`--tool` / `--args`）は、subscribe とは別に任意の MCP tool を単発 `tools/call` 呼び出しして即終了するモードで、同じ認証経路を再利用する（#111）。
-2. **リファレンス MCP Streamable HTTP サーバー**（`src/server/`）— クライアントが subscribe した後に更新される 1 つの resource（`test://review/status`）を公開し、`notifications/resources/updated` を送信する。probe クライアントのローカル / Docker テスト用に維持されており、本番トラフィック向けではない。
+1. **CLI probe**（`mcp-resource-subscriber`、`src/client/cli.ts`）— CLI エージェントのワークフローや外部ツール（例: `squirrel-notifier`）が、MCP resource を subscribe して `notifications/resources/updated` を待ち、結果を構造化された stdout/JSON として報告させるために呼び出す、公開済みのサブプロセス。**protocol revision は `2026-07-28` に pin しており、legacy へフォールバックしない**（#162）。mcp-gateway 向け認証（`--login` / `--logout`、キャッシュ済みトークンの自動更新）も担い、これらの呼び出し元がトークンを手動で用意する必要をなくす。`call` サブコマンド（`--tool` / `--args`）は、subscribe とは別に任意の MCP tool を単発 `tools/call` 呼び出しして即終了するモードで、同じ認証経路を再利用する（#111）。
+2. **リファレンス MCP Streamable HTTP サーバー**（`src/server/`）— stateless（`legacy: "reject"`）。1 つの resource（`test://review/status`）を公開し、最初の `resources/read` を起点に更新をシミュレートして、開いている `subscriptions/listen` stream へ `notifications/resources/updated` を配信する。probe クライアントのローカル / Docker テスト用に維持されており、本番トラフィック向けではない。
 
 ## 必須コマンド
 
@@ -33,12 +33,13 @@ src/
   server/
     index.ts         — エントリポイント: 環境設定を読み込み、Express HTTP サーバーを起動
     config.ts        — TestConfig 型 + configFromEnv()（全環境変数をここでパース）
-    httpServer.ts    — createMcpHttpApp(): McpServer を StreamableHTTP transport 経由で Express に接続
-    mcpServer.ts     — createProbeServer(): MCP ハンドラを登録（list/read/subscribe/unsubscribe + tool）
+    httpServer.ts    — createMcpHttpApp(): createMcpHandler（legacy: "reject"）+ toNodeHandler を Express にマウントし、{ app, close } を返す。resource の状態と更新シミュレーションは McpServer がリクエストごとに作り直されるためここ（アプリスコープ）に置く
+    mcpServer.ts     — createProbeServer(): MCP ハンドラを登録（list/read + tool）。2026-07-28 に resources/subscribe RPC は無く、通知配信は handler.notify.resourceUpdated() が担う
     resourceState.ts — ReviewStatusStore（in-memory、version 1→2）、renderReviewStatus()、定数
     logger.ts        — createConsoleLogger(config): logLevel が 'silent' でない限り全行を出力する LogSink を返す（レベル階層フィルタなし）
   client/
-    probeClient.ts   — runSubscribeProbe(): 全フローを実行し型付き結果を返す SDK クライアント
+    probeClient.ts   — runSubscribeProbe(): 全フローを実行し型付き結果を返す SDK クライアント（subscriptions/listen → ack 検証 → 通知待機 → 再 read → stream close）
+    protocolNegotiation.ts — protocol revision を 2026-07-28 に pin する Client オプションと connectPinned()。negotiation 失敗を ProtocolNegotiationError に正規化する（ネットワーク起因は素通し）
     callClient.ts    — runToolCall(): call サブコマンド用、単発 tools/call を実行し型付き結果を返す SDK クライアント
     callJsonOutput.ts — call サブコマンドの --json 出力スキーマ（CallJsonOutput）
     cli.ts           — 公開 bin エントリ; --url, --uri, --auth-token, --login, --logout, --skip-resource-list-check, --timeout-ms に加え `call` サブコマンド（--tool, --args）をサポート

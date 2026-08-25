@@ -1,4 +1,4 @@
-import type { Resource } from "@modelcontextprotocol/sdk/types.js";
+import type { Resource } from "@modelcontextprotocol/server";
 import type { TestConfig } from "./config.js";
 
 export const REVIEW_STATUS_URI = "test://review/status";

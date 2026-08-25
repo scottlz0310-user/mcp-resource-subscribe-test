@@ -56,20 +56,19 @@ async function startCapturingMcpServer(): Promise<{
     captured.push(req.headers.authorization);
     next();
   });
-  app.use(
-    createMcpHttpApp(
-      {
-        port: 0,
-        mcpPath: "/mcp",
-        updateDelaySeconds: 0.05,
-        initialStatus: "pending",
-        updatedStatus: "reviewed",
-        sendListChanged: false,
-        logLevel: "silent",
-      },
-      () => {},
-    ),
+  const probe = createMcpHttpApp(
+    {
+      port: 0,
+      mcpPath: "/mcp",
+      updateDelaySeconds: 0.05,
+      initialStatus: "pending",
+      updatedStatus: "reviewed",
+      sendListChanged: false,
+      logLevel: "silent",
+    },
+    () => {},
   );
+  app.use(probe.app);
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
   const { port } = server.address() as AddressInfo;

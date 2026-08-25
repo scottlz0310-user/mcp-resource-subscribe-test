@@ -2,7 +2,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ProtocolError, ProtocolErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
 import { AuthLoginRequiredError, AuthTimeoutError, loginToGateway, resolveCachedToken } from "./auth/gatewayAuth.js";
 import { OAuthRequestError } from "./auth/oauthClient.js";
 import { openTokenStore, tokenStoreExists } from "./auth/tokenStore.js";
@@ -11,9 +11,13 @@ import { buildCallErrorJsonOutput, buildCallJsonOutput } from "./callJsonOutput.
 import { buildErrorJsonOutput, buildJsonOutput } from "./jsonOutput.js";
 import { classifyNetworkError } from "./networkErrorClassification.js";
 import { extractRecommendedAction, runSubscribeProbe } from "./probeClient.js";
+import { PROTOCOL_UNSUPPORTED_HINT, ProtocolNegotiationError } from "./protocolNegotiation.js";
 
 // Default URI for the bundled reference server
 const REVIEW_STATUS_URI = "test://review/status";
+
+const TOOL_REQUEST_REJECTED_HINT =
+  "The server rejected the tools/call request before running the tool (unknown tool name or invalid arguments). Check --tool and --args.";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 // Try compiled path (dist/src/) first, then source path (src/) for tsx direct-run
@@ -278,10 +282,11 @@ function printResult(result: Awaited<ReturnType<typeof runSubscribeProbe>>, url:
     console.log(result.initialText);
   }
   console.log(`route ${result.route}`);
-  console.log(`subscribed ${result.subscribed}`);
+  console.log(`listen-acknowledged ${result.listenAcknowledged}`);
+  console.log(`honored-uris ${JSON.stringify(result.honoredUris)}`);
   console.log(`notification-received ${result.route === "subscription"}`);
   console.log(`notification-count ${result.notificationCount}`);
-  console.log(`unsubscribed ${result.unsubscribed}`);
+  console.log(`close-reason ${result.closeReason ?? "null"}`);
   const recommendedAction = extractRecommendedAction(result.finalText);
   if (recommendedAction) {
     console.log(`recommended_next_action ${recommendedAction}`);
@@ -437,9 +442,24 @@ async function runCallCommand(): Promise<void> {
     } else if (error instanceof OAuthRequestError) {
       errorCode = "AUTH_REFRESH_FAILED";
       exitCode = 2;
-    } else if (error instanceof StreamableHTTPError && (error.code === 401 || error.code === 403)) {
+    } else if (error instanceof SdkHttpError && (error.status === 401 || error.status === 403)) {
       errorCode = "AUTH_FAILED";
       exitCode = 2;
+    } else if (error instanceof ProtocolNegotiationError) {
+      errorCode = "PROTOCOL_UNSUPPORTED";
+      exitCode = 3;
+      recommendedNextAction = PROTOCOL_UNSUPPORTED_HINT;
+      console.error(`hint: ${PROTOCOL_UNSUPPORTED_HINT}`);
+    } else if (
+      error instanceof ProtocolError &&
+      (error.code === ProtocolErrorCode.InvalidParams || error.code === ProtocolErrorCode.MethodNotFound)
+    ) {
+      // 不明な tool 名・不正な引数は、tool の実行失敗（isError）ではなく
+      // tools/call 自体の拒否として返る。通信エラーと同じ袋に入れない。
+      errorCode = "TOOL_REQUEST_REJECTED";
+      exitCode = 3;
+      recommendedNextAction = TOOL_REQUEST_REJECTED_HINT;
+      console.error(`hint: ${TOOL_REQUEST_REJECTED_HINT}`);
     } else {
       const classified = classifyNetworkError(error);
       if (classified) {
@@ -528,6 +548,10 @@ if (args[0] === "call") {
       // Transient gateway-side refresh failure (5xx / temporarily_unavailable);
       // the refresh token was restored server-side, so a plain retry is enough.
       errorCode = "AUTH_REFRESH_FAILED";
+    } else if (error instanceof ProtocolNegotiationError) {
+      errorCode = "PROTOCOL_UNSUPPORTED";
+      recommendedNextAction = PROTOCOL_UNSUPPORTED_HINT;
+      console.error(`hint: ${PROTOCOL_UNSUPPORTED_HINT}`);
     } else {
       const classified = classifyNetworkError(error);
       if (classified) {

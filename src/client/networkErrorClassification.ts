@@ -20,7 +20,20 @@ export interface NetworkErrorClassification {
   recommendedNextAction: string;
 }
 
-/** Walks `error.cause` chains for matching TLS/network error codes. */
+/**
+ * The next link in a cause chain. `SdkError` does not use the standard `cause`
+ * property — it carries the underlying failure in `data.cause` — so a fetch
+ * failure raised during version negotiation is only reachable through there.
+ */
+function nextCause(value: unknown): unknown {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const record = value as { cause?: unknown; data?: { cause?: unknown } };
+  return record.cause ?? record.data?.cause;
+}
+
+/** Walks cause chains for matching TLS/network error codes. */
 function findCauseCode(error: unknown, depth = 5): string | undefined {
   let current: unknown = error;
   for (let i = 0; i < depth && current; i++) {
@@ -30,7 +43,7 @@ function findCauseCode(error: unknown, depth = 5): string | undefined {
         return code;
       }
     }
-    current = current instanceof Error ? current.cause : undefined;
+    current = nextCause(current);
   }
   return undefined;
 }
