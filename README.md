@@ -2,7 +2,7 @@
 
 CLI probe for MCP resource subscriptions — connects to any MCP Streamable HTTP server, opens a `subscriptions/listen` stream for a resource, receives live update notifications, and re-reads updated content.
 
-> **Protocol**: this CLI speaks MCP protocol revision **`2026-07-28` only**. It pins negotiation to that revision and never falls back to the 2025-era `resources/subscribe` path — a server that cannot offer `2026-07-28` fails with `PROTOCOL_UNSUPPORTED`.
+> **Protocol**: this CLI speaks MCP protocol revision **`2026-07-28` only**. It pins negotiation to that revision and never falls back to the 2025-era `resources/subscribe` path — a server that cannot offer `2026-07-28` fails with `PROTOCOL_UNSUPPORTED`. See [`docs/protocol-migration.md`](docs/protocol-migration.md) for the interoperability matrix, the rollout order, and why no legacy path is kept.
 
 ---
 
