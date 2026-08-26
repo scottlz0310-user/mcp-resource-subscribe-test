@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-26
+
 ### Added
 
-- `docs/protocol-migration.md`: MCP `2026-07-28` の採用 protocol、mcp-gateway / thread-owl / review-raven / 本 CLI / squirrel-notifier / Mcp-Docker の対応 matrix、移行順（gateway → server → client）とその根拠、legacy 経路を残さない判断と撤去済み範囲を記録。#162 の完了条件のうち PR #168 で後続 PR に分割した文書化項目に対応する（横断 tracker: scottlz0310/thread-owl#165）。README 冒頭の protocol 注記と `AGENTS.md` からリンクした
+- `docs/protocol-migration.md`: MCP `2026-07-28` の採用 protocol、mcp-gateway / thread-owl / review-raven / 本 CLI / squirrel-notifier / Mcp-Docker の対応 matrix、移行順（gateway → server → client）とその根拠、endpoint（client / server）で legacy 経路を残さない判断と撤去済み範囲、および protocol-independent な gateway がその対象外である理由（legacy `initialize` / `Mcp-Session-Id` の透過は恒久的な回帰要件）を記録。#162 の完了条件のうち PR #168 で後続 PR に分割した文書化項目に対応する（横断 tracker: scottlz0310/thread-owl#165）。README 冒頭の protocol 注記と `AGENTS.md` からリンクした
 
 ### Fixed
 
@@ -235,7 +237,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `src/server/mcpServer.ts` contains a hardcoded version string (bundled test server, not part of the published npm package). This must be updated manually on each version bump. `src/client/probeClient.ts` / `src/client/callClient.ts` resolve their version dynamically from `package.json` as of v0.5.0 and no longer need manual updates.
 
-[Unreleased]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/scottlz0310/mcp-resource-subscriber/compare/v0.3.0...v0.4.0
