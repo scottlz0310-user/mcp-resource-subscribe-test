@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `docs/protocol-migration.md`: MCP `2026-07-28` の採用 protocol、mcp-gateway / thread-owl / review-raven / 本 CLI / squirrel-notifier / Mcp-Docker の対応 matrix、移行順（gateway → server → client）とその根拠、legacy 経路を残さない判断と撤去済み範囲を記録。#162 の完了条件のうち PR #168 で後続 PR に分割した文書化項目に対応する（横断 tracker: scottlz0310/thread-owl#165）。README 冒頭の protocol 注記と `AGENTS.md` からリンクした
+
 ### Fixed
 
 - `vitest` が `dist/test/*.test.js` も収集し、`pnpm run build` 後の test 実行でコンパイル済みのテストが二重実行されていたのを修正。vitest 4 の `defaultExclude` から `dist` が外れたのが原因で、`vitest.config.ts` の `test.exclude` に `dist/**` を明示した。`ci.yml`（`build` → `test:coverage`）と `publish.yml`（`build` → `typecheck` → `test`）も build 後に test を実行するため CI でも二重実行が起きていたが、clean checkout では `dist/` が常に同一コミットの build 成果物であり検証結果自体は正しかったため、公開物への影響はない。ローカルでは古い `dist/` が残っていると、ソースを直した後もコンパイル前のテストが緑で通り得た
+
+### Internal
+
+- `.gitignore` と `.dockerignore` に `.pnpm-store` を追加。pnpm はグローバルストアへのリンク可否テストに失敗するとプロジェクト直下の `.pnpm-store/` にフォールバックするため、条件次第でワークツリーが汚れ、Docker のビルドコンテキストにも入っていた
 
 ## [0.6.0] - 2026-08-25
 

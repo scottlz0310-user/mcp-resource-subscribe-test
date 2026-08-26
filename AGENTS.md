@@ -121,6 +121,7 @@ test/
 - `results/compatibility-matrix.md` — Round 1 互換性マトリクス（resource のみのテスト）
 - `results/compatibility-matrix-v2.md` — Round 2 互換性マトリクス（tool + resource テスト、最新）
 - `results/` — 各エージェントテスト実行のセッションログ
+- `docs/protocol-migration.md` — MCP `2026-07-28` の採用 protocol、repo 間の対応 matrix、移行順、legacy 撤去条件（#162 の完了条件に対応）
 - `docs/verification-guide.md` — Round 1 手動検証手順
 - `docs/verification-guide-v2.md` — Round 2 手動検証手順（最新）
 - `docs/skills/pr-review-subscribe/SKILL.md` — subscribe 経由の PR レビュー用 Codex skill テンプレート
