@@ -45,19 +45,23 @@ updates in this repository are applied by hand.
 ## Compatibility matrix
 
 `2026-07-28 since` is the first release of that component that speaks the new
-revision. Anything older cannot interoperate with anything in this table.
+revision — for the endpoints (clients and servers), an older release cannot
+interoperate with anything else in this table. The gateway is not an endpoint:
+it is protocol-independent, so its entry means the release from which the
+transparency contract is *guaranteed by tests*, not the release from which it
+became compatible.
 
 | Repository | Role | `2026-07-28` since | Latest release | Legacy `initialize` |
 |---|---|---|---|---|
-| [mcp-gateway](https://github.com/scottlz0310/mcp-gateway) | transparent proxy | v0.10.0 | v0.10.0 | passes through; mints no session |
+| [mcp-gateway](https://github.com/scottlz0310/mcp-gateway) | transparent proxy | v0.10.0 (contract guaranteed; older releases unverified, not necessarily incompatible) | v0.10.0 | passed through — permanent regression requirement, alongside `Mcp-Session-Id` |
 | [thread-owl](https://github.com/scottlz0310/thread-owl) | server | v0.4.0 | v0.4.1 | rejected (`legacy: "reject"`) |
 | [review-raven](https://github.com/scottlz0310/review-raven) | server | v0.2.0 (stateless), v0.3.0 (legacy rejected) | v0.3.0 | rejected (`-32022`) |
 | **mcp-resource-subscriber** | client (this repo) | v0.6.0 | v0.6.0 | never offered (pinned) |
 | [squirrel-notifier](https://github.com/scottlz0310/squirrel-notifier) | downstream consumer of this CLI | `main` (PRs [#246](https://github.com/scottlz0310/squirrel-notifier/pull/246) / [#247](https://github.com/scottlz0310/squirrel-notifier/pull/247)) | v0.6.0 (pre-migration) | n/a |
 | [Mcp-Docker](https://github.com/scottlz0310/Mcp-Docker) | integrated E2E environment | — | v2.16.3 | n/a — [#230](https://github.com/scottlz0310/Mcp-Docker/issues/230) open |
 
-Because no component keeps a fallback, a version mismatch fails loudly in one
-of two directions:
+Because neither endpoint keeps a fallback, a mismatch between a client and a
+server fails loudly in one of two directions:
 
 - **Old client → migrated server**: the server answers the 2025-era
   `initialize` with JSON-RPC error `-32022`.
@@ -68,9 +72,13 @@ of two directions:
 
 The gateway is transparent by contract, so it never resolves such a mismatch —
 it forwards the failure. That transparency contract (no session minting, no SSE
-buffering, keep-alive comment lines preserved, `MCP-Protocol-Version` forwarded
-unchanged) is fixed by contract tests in mcp-gateway and specified in its
-`docs/mcp-protocol-transparency.md`.
+buffering, keep-alive comment lines preserved, `MCP-Protocol-Version` and
+`Mcp-Session-Id` forwarded unchanged in both directions for modern *and* legacy
+traffic) is fixed by contract tests in mcp-gateway and specified in its
+`docs/mcp-protocol-transparency.md`. Note that the gateway's `Mcp-Session-Id`
+pass-through is deliberately permanent: it is a regression requirement so the
+gateway can keep routing upstreams that still speak the older protocol. The
+gateway never interprets the header itself.
 
 ---
 
@@ -79,9 +87,13 @@ unchanged) is fixed by contract tests in mcp-gateway and specified in its
 The migration was rolled out **gateway → server → client**.
 
 1. **mcp-gateway** ([#216](https://github.com/scottlz0310/mcp-gateway/issues/216), v0.10.0).
-   The gateway only forwards, so it is safe to migrate at any point, and doing
-   it first means neither side has to work around a proxy that still mints
-   `Mcp-Session-Id` or buffers a long-lived SSE stream.
+   The gateway only forwards and is protocol-independent, so it was never a
+   compatibility blocker. What #216 added was not new-protocol support but
+   *proof*: contract tests pinning the behaviours a long-lived
+   `subscriptions/listen` stream depends on — no SSE buffering, keep-alive
+   comment lines preserved, no session minted or required. Doing this first
+   meant that when an endpoint later failed, the gateway was already ruled out
+   as the cause.
 2. **Servers** — thread-owl
    ([#176](https://github.com/scottlz0310/thread-owl/issues/176), v0.4.0) and
    review-raven ([#111](https://github.com/scottlz0310/review-raven/issues/111),
@@ -108,9 +120,16 @@ other side.
 
 ## Legacy removal
 
-**The legacy stateful path is not retained — not even as a transitional
-compatibility shim.** This was decided on 2026-08-24 on the cross-repository
-tracker and applies to every component in the matrix above.
+**The legacy stateful path is not retained at the endpoints — not even as a
+transitional compatibility shim.** This was decided on 2026-08-24 on the
+cross-repository tracker and applies to every client and server in the matrix
+above.
+
+It does **not** apply to the gateway. Being protocol-independent, mcp-gateway
+has nothing to retain or remove: it forwards legacy `initialize` and
+`Mcp-Session-Id` unchanged, and that pass-through is a permanent regression
+requirement rather than a transitional shim. "Legacy removal" below is
+therefore about endpoints only.
 
 #165's completion condition reads: *if a legacy fallback is kept, state its
 targets, deadline, and removal criteria.* The answer here is that none is kept,
