@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Internal
 
+- `biome.json` の `$schema` を 2.5.3 から CLI と同じ 2.5.10 へ追従（`biome migrate`）。あわせて `renovate.json` に `presets/tools/biome` を追加し、以降の `@biomejs/biome` 更新で `$schema` も自動追従するようにした。この preset を extend していなかったため、#167 で CLI が 2.5.10 へ上がった際に `$schema` が取り残されていた
 - `.gitignore` と `.dockerignore` に `.pnpm-store` を追加。pnpm はグローバルストアへのリンク可否テストに失敗するとプロジェクト直下の `.pnpm-store/` にフォールバックするため、条件次第でワークツリーが汚れ、Docker のビルドコンテキストにも入っていた
 
 ## [0.6.0] - 2026-08-25
